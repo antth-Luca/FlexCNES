@@ -25,6 +25,8 @@ DATE_FIELDS = {"data_nasc", "cert_data", "rg_data", "data_entrada", "data_natura
 DIGIT_FIELDS = {"pis", "cpf", "cns", "ibge_nasc", "titulo", "zona", "secao", "ctps_num",
                 "ibge_res", "cep", "telefone", "cnes"}
 UPPER_FIELDS_EXCLUDE: set[str] = set()
+# campos em caixinhas que, se o valor for maior que as caixas, saem como texto corrido
+OVERFLOW_TEXT_FIELDS = {"registro", "orgao"}
 
 
 class _Painter:
@@ -86,8 +88,13 @@ class _Painter:
         for i, ch in enumerate(value):
             self.c.drawCentredString(first + w * (i + 0.5), self.y(baseline), ch.upper())
 
-    def cells(self, value: str, xs: list[float], ytop: float, ybot: float, size: float = 10.0):
+    def cells(self, value: str, xs: list[float], ytop: float, ybot: float, size: float = 10.0,
+              overflow_text: bool = False):
         if not value:
+            return
+        if overflow_text and len(value) > len(xs) - 1:
+            # não cabe nas caixinhas: imprime como texto corrido sobre a área do campo
+            self.text(value, (xs[0], ytop, xs[-1], ybot), 0, size=8.5)
             return
         value = value[: len(xs) - 1]
         self.c.setFont(FONT, size)
@@ -113,7 +120,7 @@ class _Painter:
         elif kind == "comb":
             self.comb(value, *spec[1:])
         elif kind == "cells":
-            self.cells(value, *spec[1:])
+            self.cells(value, *spec[1:], overflow_text=key in OVERFLOW_TEXT_FIELDS)
 
 
 def _merge(template: Path, overlay_pdf: bytes, writer: PdfWriter) -> None:

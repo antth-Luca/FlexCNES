@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import io
+import json
+import re
 import shutil
 import subprocess
 from copy import copy, deepcopy
@@ -17,13 +19,20 @@ from openpyxl.worksheet.worksheet import Worksheet
 from .paths import resource_path
 from .validators import MESES
 
-COLS = range(1, 9)            # A..H
-HEADER_LAST_ROW = 6
-FIRST_DATA_ROW = 7
-MIN_DATA_ROWS = 18            # linhas em branco mínimas, como no modelo
+NCOLS = 14
+COLS = range(1, NCOLS + 1)    # A..N
+HEADER_LAST_ROW = 5
+FIRST_DATA_ROW = 6
+MIN_DATA_ROWS = 19            # linhas mínimas (6..24), como no modelo da regional
 TPL_FOOTER_FIRST = 25         # 1ª linha do rodapé no modelo
-TPL_FOOTER_LAST = 33
-TPL_SHEET = "MODELO"
+TPL_FOOTER_LAST = 28
+TPL_SHEET = "PLANILHA 1"
+
+# Colunas do modelo: A CNES | B Nome | C Competência | D Data envio | E Estabelecimento |
+# F-I Inclusão (nome, categoria, CPF, CNS) | J-M Exclusão (nome, categoria, CPF, CNS) | N Outras alterações
+COL_ESTAB, COL_OUTRAS = 5, 14
+COLS_INCLUSAO = (6, 7, 8, 9)
+COLS_EXCLUSAO = (10, 11, 12, 13)
 
 
 def sheet_name(ano: int, mes: int) -> str:
@@ -51,6 +60,8 @@ def build_month_sheet(
     linhas: list[dict[str, Any]],
     realizado_por: str,
     observacoes: str = "",
+    uf: str = "",
+    regional: str = "",
 ) -> None:
     """Escreve o conteúdo de uma aba mensal em `ws` (que deve estar vazia).
 
@@ -61,7 +72,7 @@ def build_month_sheet(
 
     # larguras de coluna
     for _, dim in tpl.column_dimensions.items():
-        for idx in range(dim.min, min(dim.max, 12) + 1):
+        for idx in range(dim.min, min(dim.max, NCOLS) + 1):
             ws.column_dimensions[get_column_letter(idx)].width = dim.width
 
     # cabeçalho (linhas 1-6)
@@ -74,7 +85,7 @@ def build_month_sheet(
     for rng in tpl.merged_cells.ranges:
         if rng.max_row <= HEADER_LAST_ROW:
             ws.merge_cells(str(rng))
-    ws["A3"] = f"MUNICÍPIO: {municipio.upper()}"
+    ws["A2"] = _titulo_municipio(municipio, uf, regional)
 
     # linhas de dados
     n = max(MIN_DATA_ROWS, len(linhas))
@@ -93,9 +104,21 @@ def build_month_sheet(
             ws.cell(r, 3, it["competencia"])
             ws.cell(r, 4, it.get("data_envio"))
             ws.cell(r, 4).number_format = "dd/mm/yyyy"
-            for col, key in ((5, "estab"), (6, "inclusao"), (7, "exclusao"), (8, "outras")):
+            for col, key in ((COL_ESTAB, "estab"), (COL_OUTRAS, "outras")):
                 if it.get(key):
-                    ws.cell(r, col, it[key])
+                    cell = ws.cell(r, col, it[key])
+                    al = copy(cell.alignment)
+                    al.wrap_text, al.vertical = True, "center"   # texto longo quebra em vez de cortar
+                    cell.alignment = al
+            for prefix, cols in (("inclusao", COLS_INCLUSAO), ("exclusao", COLS_EXCLUSAO)):
+                if not it.get(prefix):
+                    continue
+                for col, suf in zip(cols, ("", "_cat", "_cpf", "_cns")):
+                    val = it.get(prefix + suf)
+                    if val:
+                        cell = ws.cell(r, col, val)
+                        if suf in ("_cpf", "_cns"):
+                            cell.number_format = "@"   # texto: preserva zeros à esquerda
 
     # rodapé: copia as linhas 25..33 do modelo logo após os dados
     offset = (FIRST_DATA_ROW + n) - TPL_FOOTER_FIRST
@@ -110,10 +133,11 @@ def build_month_sheet(
         if rng.min_row >= TPL_FOOTER_FIRST:
             ws.merge_cells(
                 start_row=rng.min_row + offset, end_row=rng.max_row + offset,
-                start_column=rng.min_col, end_column=rng.max_col,
+                start_column=rng.min_col, end_column=min(rng.max_col, NCOLS),  # o modelo mescla até XFD
             )
-    ws.cell(27 + offset, 1, f"ALTERAÇÕES REALIZADAS POR: {realizado_por.upper()}")
-    ws.cell(28 + offset, 1, "OBSERVAÇÕES:  " + observacoes)
+    ws.cell(TPL_FOOTER_FIRST + offset, 1, f"ALTERAÇÕES FEITA POR: {realizado_por.upper()}")
+    if observacoes.strip():
+        ws.cell(TPL_FOOTER_FIRST + 1 + offset, 1, "OBSERVAÇÕES:  " + observacoes.strip())
 
     # configuração de página e logo
     ws.page_setup.orientation = tpl.page_setup.orientation
@@ -123,12 +147,39 @@ def build_month_sheet(
     ws.sheet_properties.pageSetUpPr = openpyxl.worksheet.properties.PageSetupProperties(fitToPage=True)
     for attr in ("left", "right", "top", "bottom", "header", "footer"):
         setattr(ws.page_margins, attr, getattr(tpl.page_margins, attr))
-    ws.print_area = f"A1:H{TPL_FOOTER_LAST + offset}"
+    ws.print_area = f"A1:N{TPL_FOOTER_LAST + offset}"
     for img in tpl._images:
         new = XLImage(io.BytesIO(img._data()))
         new.anchor = deepcopy(img.anchor)
         ws.add_image(new)
     tpl_wb.close()
+
+
+def _digits(v: Any) -> str:
+    return "".join(ch for ch in str(v or "") if ch.isdigit())
+
+
+def _dados(r: dict[str, Any]) -> dict[str, Any]:
+    d = r.get("dados")
+    if isinstance(d, dict):
+        return d
+    try:
+        return json.loads(r.get("dados_json") or "{}")
+    except (TypeError, ValueError):
+        return {}
+
+
+def _categoria(dados: dict[str, Any]) -> str:
+    """Categoria profissional da planilha: campo informado; senão a descrição (ou código) do 1º CBO."""
+    cat = str(dados.get("categoria_prof") or "").strip()
+    if cat:
+        return cat
+    for v in dados.get("vinculos") or []:
+        if (v.get("cbo_desc") or "").strip():
+            return v["cbo_desc"].strip().title()
+        if (v.get("cbo_cod") or "").strip():
+            return f"CBO: {v['cbo_cod'].strip()}"
+    return ""
 
 
 def montar_linhas(registros: Iterable[dict[str, Any]], estab: dict[str, Any],
@@ -143,18 +194,23 @@ def montar_linhas(registros: Iterable[dict[str, Any]], estab: dict[str, Any],
             "competencia": competencia_texto,
             "data_envio": _to_date(r.get("data_envio")),
         }
+        dados = _dados(r)
+        ident = {"cat": _categoria(dados), "cpf": _digits(dados.get("cpf")), "cns": _digits(dados.get("cns"))}
         if r["categoria"] == "ESTABELECIMENTO":
             item["estab"] = r.get("descricao_planilha") or "Alteração no cadastro do estabelecimento"
             item["_k"] = "estab"
-        elif r["operacao"] == "INCLUSAO":
-            item["inclusao"] = r["nome_profissional"]
-            item["_k"] = "inclusao"
-        elif r["operacao"] == "EXCLUSAO":
-            item["exclusao"] = r["nome_profissional"]
-            item["_k"] = "exclusao"
+        elif r["operacao"] in ("INCLUSAO", "EXCLUSAO"):
+            k = "inclusao" if r["operacao"] == "INCLUSAO" else "exclusao"
+            item[k] = r["nome_profissional"]
+            for suf, v in ident.items():
+                item[f"{k}_{suf}"] = v
+            item["_k"] = k
         else:
             desc = (r.get("descricao_planilha") or "").strip()
-            item["outras"] = f"{r['nome_profissional']} ({desc})" if desc else r["nome_profissional"]
+            extra = "; ".join(p for p in (
+                f"CPF {ident['cpf']}" if ident["cpf"] else "", f"CNS {ident['cns']}" if ident["cns"] else "") if p)
+            nome = f"{r['nome_profissional']} ({extra})" if extra else r["nome_profissional"]
+            item["outras"] = f"{nome} – {desc}" if desc else nome
             item["_k"] = "outras"
         out.append(item)
     out.sort(key=lambda i: (ordem[i["_k"]], str(i.get("inclusao") or i.get("exclusao")
@@ -162,6 +218,17 @@ def montar_linhas(registros: Iterable[dict[str, Any]], estab: dict[str, Any],
     for i in out:
         i.pop("_k")
     return out
+
+
+def _titulo_municipio(municipio: str, uf: str = "", regional: str = "") -> str:
+    """Título da planilha: "MUNICÍPIO: ASTORGA - PR          15ª Regional de Saúde"."""
+    nome = municipio.strip().upper()
+    if nome and uf.strip():
+        nome += f" - {uf.strip().upper()}"
+    titulo = f"MUNICÍPIO: {nome}".rstrip()
+    if regional.strip():
+        titulo += " " * 10 + regional.strip()
+    return titulo
 
 
 def _to_date(v: Any) -> date | None:
@@ -185,6 +252,8 @@ def write_workbook(
     realizado_por: str,
     observacoes: str = "",
     anexar_existente: bool = False,
+    uf: str = "",
+    regional: str = "",
 ) -> tuple[Path, bool]:
     """Grava a aba do mês em `path` (.xlsx). Retorna (caminho, substituiu_aba_existente).
 
@@ -208,7 +277,7 @@ def write_workbook(
         ws = wb.active
         ws.title = name
     build_month_sheet(ws, municipio=municipio, linhas=linhas,
-                      realizado_por=realizado_por, observacoes=observacoes)
+                      realizado_por=realizado_por, observacoes=observacoes, uf=uf, regional=regional)
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(path)
     return path, replaced

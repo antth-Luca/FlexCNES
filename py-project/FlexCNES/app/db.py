@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS estabelecimentos (
     municipio TEXT DEFAULT '',
     uf TEXT DEFAULT '',
     ibge TEXT DEFAULT '',
-    atualizado_em TEXT NOT NULL
+    atualizado_em TEXT NOT NULL,
+    regional TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS registros (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,6 +69,10 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        # migração: bancos criados antes da coluna "regional"
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(estabelecimentos)")}
+        if "regional" not in cols:
+            self.conn.execute("ALTER TABLE estabelecimentos ADD COLUMN regional TEXT DEFAULT ''")
         self.conn.commit()
 
     def close(self) -> None:
@@ -134,20 +139,21 @@ class Database:
             data.get("municipio", "").strip(),
             data.get("uf", "").strip().upper(),
             "".join(ch for ch in data.get("ibge", "") if ch.isdigit()),
+            data.get("regional", "").strip(),
             _now(),
         )
         try:
             if est_id is None:
                 cur = self.conn.execute(
                     "INSERT INTO estabelecimentos(cnes,nome_fantasia,razao_social,cnpj,"
-                    "municipio,uf,ibge,atualizado_em) VALUES (?,?,?,?,?,?,?,?)",
+                    "municipio,uf,ibge,regional,atualizado_em) VALUES (?,?,?,?,?,?,?,?,?)",
                     vals,
                 )
                 est_id = cur.lastrowid
             else:
                 self.conn.execute(
                     "UPDATE estabelecimentos SET cnes=?,nome_fantasia=?,razao_social=?,cnpj=?,"
-                    "municipio=?,uf=?,ibge=?,atualizado_em=? WHERE id=?",
+                    "municipio=?,uf=?,ibge=?,regional=?,atualizado_em=? WHERE id=?",
                     vals + (est_id,),
                 )
         except sqlite3.IntegrityError as e:

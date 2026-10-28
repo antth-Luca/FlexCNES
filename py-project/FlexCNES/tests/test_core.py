@@ -136,12 +136,15 @@ class PdfTests(unittest.TestCase):
 
 class PlanilhaTests(unittest.TestCase):
     def _regs(self, n_inc=3):
+        d = {"cpf": "04854630914", "cns": "703205645229093", "categoria_prof": "Auxiliar de Enfermagem"}
         regs = [dict(categoria="PROFISSIONAL", operacao="INCLUSAO", nome_profissional=f"Pessoa {i}",
-                     data_envio="2026-10-27", descricao_planilha="") for i in range(n_inc)]
+                     data_envio="2026-10-27", descricao_planilha="", dados=d) for i in range(n_inc)]
         regs.append(dict(categoria="PROFISSIONAL", operacao="EXCLUSAO", nome_profissional="Saiu",
-                         data_envio="2026-10-27", descricao_planilha=""))
+                         data_envio="2026-10-27", descricao_planilha="",
+                         dados={"cpf": "11228170967", "cns": "709806041946495",
+                                "vinculos": [{"cbo_desc": "MEDICO CLINICO", "cbo_cod": "225125"}]}))
         regs.append(dict(categoria="PROFISSIONAL", operacao="ALTERACAO", nome_profissional="Mudou",
-                         data_envio="2026-10-27", descricao_planilha="Horário Ambulatorial"))
+                         data_envio="2026-10-27", descricao_planilha="Horário Ambulatorial", dados={}))
         regs.append(dict(categoria="ESTABELECIMENTO", operacao="ALTERACAO", nome_profissional="",
                          data_envio="2026-10-27", descricao_planilha="Novo telefone"))
         return regs
@@ -150,22 +153,37 @@ class PlanilhaTests(unittest.TestCase):
         linhas = planilha.montar_linhas(self._regs(), ESTAB, "OUTUBRO")
         with tempfile.TemporaryDirectory() as t:
             p, rep = planilha.write_workbook(Path(t) / "p.xlsx", ano=2026, mes=10,
-                                             municipio="Astorga", linhas=linhas,
+                                             municipio="Astorga", uf="pr", regional="15ª Regional de Saúde", linhas=linhas,
                                              realizado_por="Maria", observacoes="obs")
             wb = openpyxl.load_workbook(p)
         self.assertEqual(wb.sheetnames, ["Outubro2026"])
         ws = wb.active
-        self.assertEqual(ws["A3"].value, "MUNICÍPIO: ASTORGA")
-        self.assertEqual(ws["A7"].value, 2733579)
-        self.assertEqual(ws["E7"].value, "Novo telefone")
-        self.assertEqual(ws["F8"].value, "Pessoa 0")
-        self.assertEqual(ws["G11"].value, "Saiu")
-        self.assertEqual(ws["H12"].value, "Mudou (Horário Ambulatorial)")
-        self.assertEqual(ws["D7"].value.date(), date(2026, 10, 27))
-        # rodapé logo após 18 linhas mínimas: dados 7..24, rodapé 27 -> +0
-        self.assertEqual(ws["A27"].value, "ALTERAÇÕES REALIZADAS POR: MARIA")
-        self.assertTrue(ws["A28"].value.endswith("obs"))
-        self.assertEqual(len(ws._images), 1)
+        self.assertEqual(ws["A2"].value, "MUNICÍPIO: ASTORGA - PR          15ª Regional de Saúde")
+        self.assertEqual(ws["A6"].value, 2733579)
+        self.assertEqual(ws["E6"].value, "Novo telefone")
+        self.assertEqual((ws["F7"].value, ws["G7"].value), ("Pessoa 0", "Auxiliar de Enfermagem"))
+        self.assertEqual((ws["H7"].value, ws["I7"].value), ("04854630914", "703205645229093"))
+        self.assertEqual(ws["J10"].value, "Saiu")
+        self.assertEqual((ws["K10"].value, ws["L10"].value, ws["M10"].value),
+                         ("Medico Clinico", "11228170967", "709806041946495"))
+        self.assertEqual(ws["N11"].value, "Mudou – Horário Ambulatorial")
+        self.assertEqual(ws["D6"].value.date(), date(2026, 10, 27))
+        # dados 6..24 (19 linhas mínimas); rodapé começa na linha 25
+        self.assertEqual(ws["A25"].value, "ALTERAÇÕES FEITA POR: MARIA")
+        self.assertEqual(ws["A26"].value, "OBSERVAÇÕES:  obs")
+        self.assertIn("A25:N25", [str(r) for r in ws.merged_cells.ranges])
+        self.assertEqual(ws.print_area, "'Outubro2026'!$A$1:$N$28")
+
+    def test_titulo_sem_regional_ou_uf(self):
+        self.assertEqual(planilha._titulo_municipio("Astorga"), "MUNICÍPIO: ASTORGA")
+        self.assertEqual(planilha._titulo_municipio("", "", "X Regional"), "MUNICÍPIO:" + " " * 10 + "X Regional")
+
+    def test_alteracao_com_cpf_cns_no_texto(self):
+        regs = [dict(categoria="PROFISSIONAL", operacao="ALTERACAO", nome_profissional="Ana",
+                     data_envio="2026-10-27", descricao_planilha="CBO X para Y",
+                     dados={"cpf": "123", "cns": "456"})]
+        ln = planilha.montar_linhas(regs, ESTAB, "OUTUBRO")[0]
+        self.assertEqual(ln["outras"], "Ana (CPF 123; CNS 456) – CBO X para Y")
 
     def test_rodape_desce_com_muitas_linhas(self):
         linhas = planilha.montar_linhas(self._regs(n_inc=30), ESTAB, "OUTUBRO")  # 33 linhas
@@ -173,9 +191,8 @@ class PlanilhaTests(unittest.TestCase):
             p, _ = planilha.write_workbook(Path(t) / "p.xlsx", ano=2026, mes=10, municipio="Astorga",
                                            linhas=linhas, realizado_por="Maria")
             ws = openpyxl.load_workbook(p).active
-        self.assertEqual(ws["A7"].value, 2733579)
-        self.assertEqual(ws["A27"].value, 2733579)   # ainda é linha de dados
-        self.assertEqual(ws["A" + str(27 + len(linhas) - 18)].value, "ALTERAÇÕES REALIZADAS POR: MARIA")
+        self.assertEqual(ws["A24"].value, 2733579)   # ainda é linha de dados
+        self.assertEqual(ws["A" + str(25 + len(linhas) - 19)].value, "ALTERAÇÕES FEITA POR: MARIA")
 
     def test_anexar_e_substituir(self):
         linhas = planilha.montar_linhas(self._regs(), ESTAB, "OUTUBRO")
@@ -243,6 +260,23 @@ class CnesTests(unittest.TestCase):
             rep = cnes_import.import_zip(z, Path(t) / "c.db")
             self.assertEqual(sorted(rep["nao_encontradas"]), ["cbo", "estabelecimento", "municipio"])
             self.assertFalse(cnes_import.CnesBase(Path(t) / "c.db").available())
+
+
+class RegionalDbTests(unittest.TestCase):
+    def test_regional_salva_e_migra_banco_antigo(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as t:
+            f = Path(t) / "velho.db"
+            c = sqlite3.connect(f)   # banco antigo, sem a coluna "regional"
+            c.executescript("""CREATE TABLE estabelecimentos (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cnes TEXT NOT NULL UNIQUE, nome_fantasia TEXT NOT NULL, razao_social TEXT DEFAULT '',
+                cnpj TEXT DEFAULT '', municipio TEXT DEFAULT '', uf TEXT DEFAULT '', ibge TEXT DEFAULT '',
+                atualizado_em TEXT NOT NULL);""")
+            c.commit(); c.close()
+            db = Database(f)
+            eid = db.save_estabelecimento({**ESTAB, "regional": " 15ª Regional de Saúde "})
+            self.assertEqual(db.get_estabelecimento(eid)["regional"], "15ª Regional de Saúde")
+            db.close()
 
 
 class IbgeValidationTests(unittest.TestCase):

@@ -212,7 +212,7 @@ def main():
     dlg.salvar()
     check("nome fantasia" in LOG["errors"][-1][1].lower(), "nome fantasia obrigatório")
     dlg.form.set({"cnes": "2733579", "nome_fantasia": "HOSPITAL REGIONAL CRISTO REI",
-                  "municipio": "Astorga", "uf": "PR", "ibge": "4102000"})
+                  "municipio": "Astorga", "uf": "PR", "ibge": "4102000", "regional": "15ª Regional de Saúde"})
     dlg.salvar()
     main_f.load_estabs(dlg.result)
     check(main_f.current_estab()["cnes"] == "2733579", "estabelecimento selecionado")
@@ -221,7 +221,7 @@ def main():
     reg.nome.set("Maria Aparecida da Silva Souza")
     reg.op.set("INCLUSAO")
     reg.usa20.set(True); reg.usa21.set(True)
-    reg.f20a.set({"cpf": "52998224725", "data_nasc": "05031985", "sexo": "F", "cadastramento": "SUS"})
+    reg.f20a.set({"cpf": "52998224725", "cns": "700000000000005", "data_nasc": "05031985", "sexo": "F", "cadastramento": "SUS"})
     check(reg.f20a.vars["data_nasc"].get() == "05/03/1985", "data digitada sem barras é formatada")
     reg.f20a.vars["raca_cor"].set("01 - Branca")
     check(reg.f20a.get()["raca_cor"] == "01", "combo devolve só o código")
@@ -243,6 +243,7 @@ def main():
     print("4) só Ficha 21 / só Ficha 20")
     reg.reset()
     reg.nome.set("Joao Teste"); reg.op.set("EXCLUSAO")
+    reg.f20a.vars["cpf"].set("52998224725"); reg.f20a.vars["cns"].set("700000000000005")
     reg.usa20.set(False); reg.usa21.set(True)
     reg.vinc.form.set({"cbo_cod": "225125", "data_deslig": "31/10/2026"}); reg.vinc.add()
     reg.save(True)
@@ -285,10 +286,11 @@ def main():
     plan.export()
     import openpyxl
     ws = openpyxl.load_workbook(tmp / "saida" / "plan.xlsx").active
-    vals = [c.value for row in ws.iter_rows(min_row=7, max_row=12) for c in row if c.value]
+    vals = [c.value for row in ws.iter_rows(min_row=6, max_row=12) for c in row if c.value]
     check("Maria Aparecida da Silva Souza" in vals and "Joao Teste" in vals, "xlsx contém inclusão e exclusão")
-    check(any(isinstance(v, str) and v.startswith("Ana Alterada (Horário") for v in vals), "xlsx contém alteração com descrição")
-    check(ws["A3"].value == "MUNICÍPIO: ASTORGA" and "MARIA JULIANI" in str(ws["A27"].value), "município e responsável")
+    check(any(isinstance(v, str) and v.startswith("Ana Alterada") for v in vals), "xlsx contém alteração com descrição")
+    check(str(ws["A2"].value) == "MUNICÍPIO: ASTORGA - PR          15ª Regional de Saúde" and "MARIA JULIANI" in str(ws["A25"].value), "município e responsável")
+    check("52998224725" in vals and "700000000000005" in vals, "CPF e CNS na planilha")
 
     print("7) base CNES (importação em thread)")
     z = tmp / "cnes.zip"

@@ -74,6 +74,9 @@ class Service:
                 erros.append("Informe o nome do profissional.")
             if not (form.get("usa_ficha20") or form.get("usa_ficha21")):
                 erros.append("Marque ao menos uma ficha (20 e/ou 21).")
+            if form.get("operacao") in ("INCLUSAO", "EXCLUSAO") and not (
+                    only_digits(dados.get("cpf")) and only_digits(dados.get("cns"))):
+                avisos.append("CPF e/ou CNS não informados: as colunas correspondentes da planilha ficarão vazias.")
             if form.get("operacao") == "ALTERACAO" and not (form.get("descricao_planilha") or "").strip():
                 avisos.append("Sem descrição da alteração: na planilha constará só o nome do profissional.")
         if form.get("data_envio") and not is_blank_or_valid_date(form["data_envio"]):
@@ -189,7 +192,8 @@ class Service:
         return planilha.write_workbook(
             caminho, ano=ano, mes=mes, municipio=est.get("municipio") or "",
             linhas=linhas, realizado_por=sess.nome, observacoes=observacoes,
-            anexar_existente=anexar,
+            anexar_existente=anexar, uf=est.get("uf") or "",
+            regional=est.get("regional") or "",
         )
 
     def nome_padrao_planilha(self, est: dict, ano: int, mes: int) -> str:
