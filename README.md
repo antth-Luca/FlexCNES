@@ -1,6 +1,6 @@
-![FlexCNES logo](https://github.com/antth-Luca/FlexCNES/blob/v0.1.0/repo-icon.png)
+<p align="center"><img alt="FlexCNES logo" src="https://github.com/antth-Luca/FlexCNES/blob/v0.1.0/repo-icon.png" width="160"></p>
 
-# App FlexCNES — Assistente para preenchimento das fichas e planilha CNES
+# FlexCNES — Assistente de preenchimento de fichas e planilha CNES
 
 Aplicativo desktop (Python + CustomTkinter + SQLite), com tema Sistema/Claro/Escuro que coleta os dados e preenche:
 - **Ficha 20** (Cadastro de Profissional) e **Ficha 21** (Continuação, até 3 vínculos por página; várias páginas se preciso) — em PDF, sobre os modelos originais. Pode-se gerar só a 20, só a 21 ou as duas.
