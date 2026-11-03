@@ -949,7 +949,7 @@ class BaseTab(ctk.CTkFrame):
         self.main = main
         self.q: queue.Queue = queue.Queue()
         self.cancel = threading.Event()
-        label(self, "Isso é opcional. Importe o ZIP obtido em https://cnes.datasus.gov.br/pages/downloads/arquivosBaseDados.jsp"
+        label(self, "Isso é opcional. Importe o ZIP obtido em https://cnes.datasus.gov.br/pages/downloads/arquivosBaseDados.jsp "
                     "(ou https://cnes.datasus.gov.br → Downloads → Base de Dados) para buscar estabelecimento "
                     "pelo CNES, município (IBGE/UF) e CBO por nome. Só as tabelas necessárias são lidas, direto do ZIP. "
                     "Sem a base, tudo funciona com digitação manual.",
