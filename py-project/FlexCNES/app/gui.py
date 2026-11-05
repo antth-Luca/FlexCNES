@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import queue
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -15,9 +16,10 @@ from tkinter import filedialog, messagebox, ttk
 
 import customtkinter as ctk
 
-from . import __version__, cnes_import, planilha, settings
+from . import __version__, cnes_import, dbaccess, planilha, settings
 from .db import AuthError, Database
-from .paths import app_db_path, cnes_db_path, default_output_dir, resource_path
+from .paths import (app_db_path, cnes_db_path, db_dir, default_db_dir, default_output_dir,
+                    resource_path)
 from .security import password_problems
 from .service import OPERACOES, Service, Session, competencia_key
 from .settings import THEMES
@@ -42,7 +44,7 @@ F20_IDENT = [
     ("mae", "34.1.6 Nome da mãe", "entry", 40, None),
     ("pai", "34.1.7 Nome do pai", "entry", 40, None),
     ("data_nasc", "34.1.8 Data de nascimento", "date", 12, None),
-    ("mun_nasc", "34.1.9 Município de nascimento", "entry", 28, None),
+    ("mun_nasc", "34.1.9 Município de nascimento", "search", 18, None),
     ("ibge_nasc", "34.1.10 Cód. IBGE do município", "entry", 10, None),
     ("uf_nasc", "34.1.11 UF", "entry", 4, None),
     ("raca_cor", "34.1.12 Raça/Cor", "combo", 16, RACA_COR),
@@ -78,7 +80,7 @@ F20_RESID = [
     ("numero", "34.2.3 Número", "entry", 8, None),
     ("complemento", "34.2.4 Complemento", "entry", 16, None),
     ("bairro", "34.2.5 Bairro/Distrito", "entry", 20, None),
-    ("mun_res", "34.2.6 Município de residência", "entry", 28, None),
+    ("mun_res", "34.2.6 Município de residência", "search", 18, None),
     ("ibge_res", "34.2.7 Cód. IBGE do município", "entry", 10, None),
     ("uf_res", "34.2.8 UF", "entry", 4, None),
     ("cep", "34.2.9 CEP", "entry", 12, None),
@@ -101,7 +103,7 @@ F21_VINC = [
     ("tipo_desc", "Tipo – descrição", "entry", 24, None),
     ("sub_cod", "Sub-tipo – cód.", "entry", 6, None),
     ("sub_desc", "Sub-tipo – descrição", "entry", 20, None),
-    ("cbo_cod", "34.4.5 CBO – código", "entry", 10, None),
+    ("cbo_cod", "34.4.5 CBO – código (lupa: buscar)", "search_left", 10, None),
     ("cbo_desc", "CBO – descrição", "entry", 36, None),
     ("ch_amb", "34.4.6 CH ambulatorial", "entry", 6, None),
     ("ch_hosp", "CH hospitalar", "entry", 6, None),
@@ -226,6 +228,46 @@ def check(master, text: str, var, **kw):
                            width=34 + 8 * len(text), **kw)
 
 
+@lru_cache(maxsize=None)
+def search_icon():
+    """Lupa (PNG pré-gerado, uma versão por tema). None se a imagem não puder ser carregada."""
+    try:
+        from PIL import Image
+        light = Image.open(resource_path("assets", "icons", "search_dark.png"))
+        dark = Image.open(resource_path("assets", "icons", "search_white.png"))
+        return ctk.CTkImage(light_image=light, dark_image=dark, size=(18, 18))
+    except Exception:
+        return None
+
+
+def icon_button(master, command, **kw):
+    """Botão quadrado só com a lupa (se faltar a imagem, mostra "Buscar")."""
+    img = search_icon()
+    return button(master, "" if img else "Buscar", command, kind="secondary",
+                  image=img, width=34 if img else 64, **kw)
+
+
+SYNC_ASYNC = False   # testes: executa tarefas em segundo plano de forma síncrona
+
+
+def run_async(widget, fn, done, interval: int = 100) -> None:
+    """Roda `fn` numa thread e chama `done(resultado)` na thread da interface (sem travar a tela)."""
+    if SYNC_ASYNC:
+        done(fn())
+        return
+    q: queue.Queue = queue.Queue()
+    threading.Thread(target=lambda: q.put(fn()), daemon=True).start()
+
+    def poll():
+        try:
+            r = q.get_nowait()
+        except queue.Empty:
+            widget.after(interval, poll)
+            return
+        done(r)
+    widget.after(interval, poll)
+
+
 def theme_menu(master, app: "App"):
     """Seletor Sistema / Claro / Escuro."""
     cur = next((k for k, v in THEMES.items() if v == app.theme), "Sistema")
@@ -263,9 +305,10 @@ def _auto_date(var: tk.StringVar) -> None:
 class FormPanel(ctk.CTkFrame):
     """Formulário em grade gerado a partir de uma lista de campos."""
 
-    def __init__(self, master, fields, per_row: int = 3):
+    def __init__(self, master, fields, per_row: int = 3, actions: dict | None = None):
         super().__init__(master, fg_color="transparent")
         self.fields = fields
+        actions = actions or {}
         self.vars: dict[str, tk.StringVar] = {}
         self.kinds: dict[str, str] = {}
         for i, (key, text, kind, width, opts) in enumerate(fields):
@@ -281,6 +324,16 @@ class FormPanel(ctk.CTkFrame):
                 row.pack(anchor="w", pady=(2, 0))
                 for value, t in opts:
                     radio(row, t, value, var).pack(side="left", padx=(0, 6))
+            elif kind == "search":      # campo + botão de lupa ao lado
+                row = ctk.CTkFrame(cell, fg_color="transparent")
+                row.pack(anchor="w")
+                entry(row, var, width).pack(side="left")
+                icon_button(row, actions.get(key, lambda: None)).pack(side="left", padx=(4, 0))
+            elif kind == "search_left":  # lupa ANTES do campo
+                row = ctk.CTkFrame(cell, fg_color="transparent")
+                row.pack(anchor="w")
+                icon_button(row, actions.get(key, lambda: None)).pack(side="left", padx=(0, 4))
+                entry(row, var, width).pack(side="left")
             elif kind == "combo":
                 combo(cell, var, opts, width).pack(anchor="w")
             else:
@@ -381,15 +434,17 @@ class EstabDialog(Modal):
 
 
 class CboSearch(Modal):
-    def __init__(self, master, base: cnes_import.CnesBase):
+    def __init__(self, master, base: cnes_import.CnesBase, inicial: str = ""):
         super().__init__(master, "Buscar CBO")
         self.base = base
         body = ctk.CTkFrame(self, fg_color="transparent")
         body.pack(padx=14, pady=12)
-        self.q = tk.StringVar()
-        e = entry(body, self.q, 56, placeholder_text="Digite ao menos 2 letras da ocupação")
+        self.q = tk.StringVar(value=inicial)
+        e = entry(body, self.q, 56, placeholder_text="Digite o código ou parte da descrição (mín. 2 caracteres)")
         e.pack(anchor="w")
         e.bind("<KeyRelease>", lambda ev: self.refresh())
+        e.bind("<Return>", lambda ev: self.pick(first=True))
+        e.focus_set()
         c = tree_colors()
         self.lb = tk.Listbox(body, width=70, height=14, bg=c["bg"], fg=c["fg"], borderwidth=0,
                              highlightthickness=0, selectbackground=c["sel"],
@@ -398,6 +453,8 @@ class CboSearch(Modal):
         self.lb.bind("<Double-Button-1>", lambda ev: self.pick())
         self.items: list[tuple[str, str]] = []
         button(body, "Usar selecionado", self.pick).pack(anchor="e")
+        if inicial:
+            self.refresh()
 
     def refresh(self):
         t = self.q.get().strip()
@@ -406,11 +463,364 @@ class CboSearch(Modal):
         for cod, desc in self.items:
             self.lb.insert("end", f"{cod} – {desc}")
 
-    def pick(self):
+    def pick(self, first: bool = False):
         sel = self.lb.curselection()
         if sel:
             self.result = self.items[sel[0]]
             self.destroy()
+        elif first and len(self.items) == 1:   # Enter com um único resultado: usa direto
+            self.result = self.items[0]
+            self.destroy()
+
+
+# ------------------------------------------------------------------------------
+# Senha, administração de usuários e local do banco
+# ------------------------------------------------------------------------------
+def _form_rows(parent, rows):
+    """rows: [(rótulo, StringVar, secreto)] -> lista de CTkEntry."""
+    f = ctk.CTkFrame(parent, fg_color="transparent")
+    f.pack()
+    out = []
+    for i, (text, var, secret) in enumerate(rows):
+        label(f, text).grid(row=i, column=0, sticky="e", padx=8, pady=5)
+        e = ctk.CTkEntry(f, textvariable=var, width=260, show="•" if secret else "")
+        e.grid(row=i, column=1, pady=5)
+        out.append(e)
+    return out
+
+
+class PasswordDialog(Modal):
+    """Troca da própria senha (exige a senha atual). `forced`: senha temporária, não dá para cancelar."""
+
+    def __init__(self, master, app: "App", forced: bool = False):
+        super().__init__(master, "Alterar minha senha")
+        self.app, self.forced = app, forced
+        self.atual, self.nova, self.conf = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(padx=20, pady=16)
+        if forced:
+            label(body, "Sua senha é temporária. Defina uma nova senha para continuar.",
+                  wraplength=360, justify="left").pack(anchor="w", pady=(0, 10))
+            self.protocol("WM_DELETE_WINDOW", lambda: None)
+            self.bind("<Escape>", lambda e: None)
+        ents = _form_rows(body, [("Senha atual", self.atual, True), ("Nova senha", self.nova, True),
+                                 ("Confirmar nova senha", self.conf, True)])
+        for e in ents:
+            e.bind("<Return>", lambda ev: self.salvar())
+        ents[0].focus_set()
+        btns = ctk.CTkFrame(body, fg_color="transparent")
+        btns.pack(fill="x", pady=(12, 0))
+        if not forced:
+            button(btns, "Cancelar", self.destroy, kind="secondary").pack(side="right")
+        button(btns, "Salvar", self.salvar).pack(side="right", padx=8)
+
+    def salvar(self):
+        if self.nova.get() != self.conf.get():
+            messagebox.showerror("Senha", "A confirmação não confere com a nova senha.", parent=self)
+            return
+        try:
+            self.app.service.trocar_minha_senha(self.app.session, self.atual.get(), self.nova.get())
+        except AuthError as e:
+            messagebox.showerror("Senha", str(e), parent=self)
+            return
+        messagebox.showinfo("Senha", "Senha alterada com sucesso.", parent=self)
+        self.result = True
+        self.destroy()
+
+
+class UserDialog(Modal):
+    """Cadastro (row=None) ou edição de usuário comum, pelo administrador."""
+
+    def __init__(self, master, app: "App", row: dict | None = None):
+        super().__init__(master, "Novo usuário" if row is None else "Editar usuário")
+        self.app, self.row = app, row
+        self.usuario = tk.StringVar(value=row["usuario"] if row else "")
+        self.nome = tk.StringVar(value=row["nome"] if row else "")
+        self.senha, self.conf = tk.StringVar(), tk.StringVar()
+        self.ativo = tk.BooleanVar(value=bool(row["ativo"]) if row else True)
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(padx=20, pady=16)
+        rows = [("Usuário (login)", self.usuario, False), ("Nome completo", self.nome, False)]
+        if row is None:
+            rows += [("Senha temporária", self.senha, True), ("Confirmar senha", self.conf, True)]
+        _form_rows(body, rows)
+        if row is None:
+            label(body, "No primeiro acesso, o usuário será obrigado a trocar a senha.",
+                  font=font(12)).pack(anchor="w", pady=(6, 0))
+        else:
+            check(body, "Usuário ativo (desmarque para bloquear o acesso)", self.ativo).pack(anchor="w", pady=(8, 0))
+        btns = ctk.CTkFrame(body, fg_color="transparent")
+        btns.pack(fill="x", pady=(12, 0))
+        button(btns, "Cancelar", self.destroy, kind="secondary").pack(side="right")
+        button(btns, "Salvar", self.salvar).pack(side="right", padx=8)
+
+    def salvar(self):
+        svc, sess = self.app.service, self.app.session
+        try:
+            if self.row is None:
+                if self.senha.get() != self.conf.get():
+                    raise AuthError("A confirmação não confere com a senha.")
+                svc.criar_usuario(sess, self.usuario.get(), self.nome.get(), self.senha.get())
+            else:
+                svc.editar_usuario(sess, self.row["id"], self.usuario.get(), self.nome.get(), self.ativo.get())
+        except (AuthError, PermissionError) as e:
+            messagebox.showerror("Usuário", str(e), parent=self)
+            return
+        self.result = True
+        self.destroy()
+
+
+class ResetPasswordDialog(Modal):
+    def __init__(self, master, app: "App", row: dict):
+        super().__init__(master, "Redefinir senha")
+        self.app, self.row = app, row
+        self.senha, self.conf = tk.StringVar(), tk.StringVar()
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(padx=20, pady=16)
+        label(body, f"Usuário: {row['nome']} ({row['usuario']})", font=font(13, True)).pack(anchor="w", pady=(0, 8))
+        _form_rows(body, [("Nova senha temporária", self.senha, True), ("Confirmar senha", self.conf, True)])
+        label(body, "O usuário será obrigado a trocar esta senha no próximo acesso.",
+              font=font(12)).pack(anchor="w", pady=(6, 0))
+        btns = ctk.CTkFrame(body, fg_color="transparent")
+        btns.pack(fill="x", pady=(12, 0))
+        button(btns, "Cancelar", self.destroy, kind="secondary").pack(side="right")
+        button(btns, "Redefinir", self.salvar).pack(side="right", padx=8)
+
+    def salvar(self):
+        try:
+            if self.senha.get() != self.conf.get():
+                raise AuthError("A confirmação não confere com a senha.")
+            self.app.service.resetar_senha(self.app.session, self.row["id"], self.senha.get())
+        except (AuthError, PermissionError) as e:
+            messagebox.showerror("Senha", str(e), parent=self)
+            return
+        messagebox.showinfo("Senha", "Senha redefinida.", parent=self)
+        self.result = True
+        self.destroy()
+
+
+class DbLocationPanel(ctk.CTkFrame):
+    """Escolha da pasta do banco de dados (local ou de rede), com teste de acesso."""
+
+    def __init__(self, master, app: "App", on_changed):
+        super().__init__(master, fg_color="transparent")
+        self.app, self.on_changed = app, on_changed
+        self.var = tk.StringVar(value=str(db_dir()))
+        label(self, "Pasta do banco de dados", font=font(14, True)).pack(anchor="w", pady=(4, 2))
+        label(self, "Pasta local ou de rede do Windows (ex.: \\\\servidor\\compartilhamento\\FlexCNES). "
+                    "Todos os computadores que dividem os dados devem apontar para a mesma pasta. "
+                    "Cada computador guarda essa escolha separadamente.",
+              wraplength=640, justify="left", anchor="w", font=font(12)).pack(anchor="w")
+        row = ctk.CTkFrame(self, fg_color="transparent")
+        row.pack(fill="x", pady=8)
+        self.entry = ctk.CTkEntry(row, textvariable=self.var, width=470)
+        self.entry.pack(side="left")
+        button(row, "Procurar…", self.browse, kind="secondary", width=100).pack(side="left", padx=6)
+        row2 = ctk.CTkFrame(self, fg_color="transparent")
+        row2.pack(fill="x")
+        self.btn_test = button(row2, "Testar acesso", self.test, kind="secondary")
+        self.btn_test.pack(side="left")
+        self.btn_apply = button(row2, "Aplicar", self.apply)
+        self.btn_apply.pack(side="left", padx=8)
+        button(row2, "Restaurar padrão", self.restore_default, kind="secondary").pack(side="left")
+        self.status = label(self, "", wraplength=640, justify="left", anchor="w")
+        self.status.pack(anchor="w", pady=(10, 0))
+        label(self, "Atenção: o SQLite em pasta de rede funciona bem para poucos usuários simultâneos. "
+                    "Faça cópias de segurança da pasta com frequência.",
+              wraplength=640, justify="left", anchor="w", font=font(12)).pack(anchor="w", pady=(10, 0))
+
+    # -- helpers
+    def _folder(self) -> str:
+        folder = dbaccess.normalize_dir(self.var.get())
+        if not folder:
+            messagebox.showerror("Banco de dados", "Informe o caminho completo da pasta, por exemplo:\n"
+                                 "D:\\FlexCNES  ou  \\\\servidor\\compartilhamento\\FlexCNES", parent=self)
+        return folder
+
+    def _busy(self, busy: bool, text: str = ""):
+        state = "disabled" if busy else "normal"
+        self.btn_test.configure(state=state)
+        self.btn_apply.configure(state=state)
+        self.status.configure(text=text)
+
+    @staticmethod
+    def _same(a: str, b: str) -> bool:
+        return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+    def browse(self):
+        p = filedialog.askdirectory(parent=self, title="Pasta do banco de dados", initialdir=self.var.get() or None)
+        if p:
+            self.var.set(os.path.normpath(p))
+
+    def test(self):
+        folder = self._folder()
+        if not folder:
+            return
+        self._busy(True, "Verificando acesso…")
+        run_async(self, lambda: dbaccess.inspect_dir(folder), self._test_done)
+
+    def _test_done(self, info: dict):
+        if info["ok"]:
+            self._busy(False, "Acesso OK. " + ("Banco do FlexCNES encontrado nesta pasta." if info["has_db"]
+                                                else "Ainda não há banco nesta pasta."))
+        else:
+            self._busy(False, "Falha no acesso.")
+            messagebox.showerror("Banco de dados", info["msg"], parent=self)
+
+    def restore_default(self):
+        self.var.set(str(default_db_dir()))
+        self.apply()
+
+    def apply(self):
+        folder = self._folder()
+        if not folder:
+            return
+        if self._same(folder, str(db_dir())):
+            messagebox.showinfo("Banco de dados", "Esta já é a pasta em uso.", parent=self)
+            return
+        self._busy(True, "Verificando acesso…")
+        run_async(self, lambda: dbaccess.inspect_dir(folder), lambda info: self._apply_checked(folder, info))
+
+    def _apply_checked(self, folder: str, info: dict):
+        self._busy(False, "")
+        if not info["ok"]:
+            messagebox.showerror("Banco de dados", info["msg"], parent=self)
+            return
+        if info["has_db"]:
+            if not messagebox.askyesno(
+                    "Banco de dados", "Já existe um banco do FlexCNES nessa pasta.\n\nUsar esse banco? "
+                    "Os dados deste computador NÃO serão copiados para lá.", parent=self):
+                return
+        else:
+            cur = self.app.db
+            try:
+                has_data = cur is not None and cur.user_count() > 0
+            except sqlite3.Error:
+                has_data = False
+            if has_data:
+                if not messagebox.askyesno(
+                        "Banco de dados", "Não há banco nessa pasta.\n\nCopiar o banco atual para lá e usá-lo "
+                        "a partir de agora?", parent=self):
+                    return
+                try:
+                    dbaccess.copy_db(cur.path, folder)
+                except Exception as e:  # noqa: BLE001
+                    messagebox.showerror("Banco de dados", f"Não foi possível copiar o banco:\n{e}", parent=self)
+                    return
+        stored = "" if self._same(folder, str(default_db_dir())) else folder
+        if not settings.save(db_dir=stored):
+            messagebox.showerror("Banco de dados", "Não foi possível gravar a configuração neste computador.",
+                                 parent=self)
+            return
+        messagebox.showinfo("Banco de dados", "Local do banco atualizado. O programa vai reconectar; "
+                            "entre novamente com o seu usuário.", parent=self)
+        self.on_changed()
+
+
+class DbLocationDialog(Modal):
+    """Escolha do local do banco fora da área do administrador (1º acesso ou banco inacessível)."""
+
+    def __init__(self, master, app: "App", reconnect: bool = False):
+        super().__init__(master, "Local do banco de dados")
+        self.app = app
+
+        def changed():
+            self.result = True
+            self.destroy()
+            if reconnect:
+                app.reconnect()
+        panel = DbLocationPanel(self, app, changed)
+        panel.pack(padx=20, pady=14)
+        button(self, "Fechar", self.destroy, kind="secondary").pack(pady=(0, 14))
+
+
+class DbFailDialog(Modal):
+    """Banco inacessível na abertura: tentar de novo, trocar o local, usar o padrão ou sair."""
+
+    def __init__(self, master, path, msg: str):
+        super().__init__(master, "Banco de dados inacessível")
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(padx=20, pady=16)
+        label(body, "Não foi possível acessar o banco de dados.", font=font(14, True)).pack(anchor="w")
+        label(body, f"Local configurado:\n{path}\n\n{msg}", wraplength=480, justify="left",
+              anchor="w").pack(anchor="w", pady=(8, 12))
+        for key, text, kind in (("retry", "Tentar novamente", "primary"),
+                                ("change", "Escolher outro local…", "secondary"),
+                                ("default", "Usar o local padrão deste computador", "secondary"),
+                                ("exit", "Sair", "danger")):
+            button(body, text, lambda k=key: self._pick(k), kind=kind, width=300).pack(pady=3)
+
+    def _pick(self, key: str):
+        self.result = key
+        self.destroy()
+
+
+class AdminDialog(Modal):
+    """Administração: usuários comuns e local do banco de dados."""
+
+    def __init__(self, master, app: "App"):
+        super().__init__(master, "Administração")
+        self.app = app
+        self.rows: dict[str, dict] = {}
+        tabs = ctk.CTkTabview(self, width=700, height=420)
+        tabs.pack(padx=14, pady=12)
+        t_users, t_db = tabs.add("Usuários"), tabs.add("Banco de dados")
+        box = TreeBox(t_users, ("usuario", "nome", "perfil", "situacao"),
+                      (("usuario", "Usuário", 130), ("nome", "Nome", 260), ("perfil", "Perfil", 110),
+                       ("situacao", "Situação", 100)), height=10)
+        box.pack(fill="both", expand=True, pady=(4, 8))
+        self.tree = box.tree
+        row = ctk.CTkFrame(t_users, fg_color="transparent")
+        row.pack(anchor="w")
+        button(row, "Novo usuário…", self.new).pack(side="left")
+        button(row, "Editar…", self.edit, kind="secondary").pack(side="left", padx=6)
+        button(row, "Redefinir senha…", self.reset, kind="secondary").pack(side="left")
+        DbLocationPanel(t_db, app, self._db_changed).pack(anchor="w", padx=6)
+        self.refresh()
+
+    def _db_changed(self):
+        self.destroy()
+        self.app.reconnect()
+
+    def refresh(self):
+        self.tree.delete(*self.tree.get_children())
+        self.rows.clear()
+        try:
+            users = self.app.service.listar_usuarios(self.app.session)
+        except PermissionError as e:
+            messagebox.showerror("Administração", str(e), parent=self)
+            return
+        for u in users:
+            iid = self.tree.insert("", "end", values=(
+                u["usuario"], u["nome"], "Administrador" if u["perfil"] == "ADMIN" else "Comum",
+                "Ativo" if u["ativo"] else "Desativado"))
+            self.rows[iid] = u
+
+    def _selected(self) -> dict | None:
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Administração", "Selecione um usuário na lista.", parent=self)
+            return None
+        row = self.rows.get(sel[0])
+        if row and row["perfil"] == "ADMIN":
+            messagebox.showinfo("Administração", "O administrador só pode alterar a própria senha "
+                                "(menu Conta ▸ Alterar minha senha).", parent=self)
+            return None
+        return row
+
+    def new(self):
+        if UserDialog(self, self.app).run():
+            self.refresh()
+
+    def edit(self):
+        row = self._selected()
+        if row and UserDialog(self, self.app, row).run():
+            self.refresh()
+
+    def reset(self):
+        row = self._selected()
+        if row and ResetPasswordDialog(self, self.app, row).run():
+            self.refresh()
 
 
 # ------------------------------------------------------------------------------
@@ -452,6 +862,12 @@ class AuthFrame(ctk.CTkFrame):
             self.entries.append(e)
         button(inner, "Criar usuário e entrar" if first else "Entrar", self.submit,
                width=220, height=34).pack(pady=(18, 0))
+        if first:
+            button(inner, "Usar banco de dados existente (rede)…",
+                   lambda: DbLocationDialog(self, app, reconnect=True).run(),
+                   kind="secondary", width=220).pack(pady=(10, 0))
+        label(inner, f"Banco de dados: {app_db_path()}", wraplength=380, font=font(11),
+              justify="center").pack(pady=(14, 0))
         self.entries[0].focus_set()
 
     def submit(self):
@@ -463,12 +879,13 @@ class AuthFrame(ctk.CTkFrame):
                 probs = password_problems(self.pw.get())
                 if probs:
                     raise AuthError(" ".join(probs))
-                db.create_user(self.user.get(), self.nome.get(), self.pw.get())
+                db.create_first_admin(self.user.get(), self.nome.get(), self.pw.get())
             row = db.authenticate(self.user.get(), self.pw.get())
         except AuthError as e:
             messagebox.showerror("Acesso", str(e), parent=self)
             return
-        self.app.on_authenticated(Session(row["id"], row["usuario"], row["nome"]), first=self.first)
+        self.app.on_authenticated(Session(row["id"], row["usuario"], row["nome"], row["perfil"],
+                                           bool(row["trocar_senha"])), first=self.first)
 
 
 # ------------------------------------------------------------------------------
@@ -481,23 +898,24 @@ class VinculosPanel(ctk.CTkFrame):
         self.vinculos: list[dict] = []
         label(self, "Cada ficha 21 comporta 3 vínculos; acima disso, páginas adicionais são geradas "
                     "automaticamente.", wraplength=820, justify="left", anchor="w").pack(anchor="w", pady=(0, 4))
+        # Os botões são empacotados ANTES (side="bottom"): assim nunca somem quando a janela é baixa;
+        # o que encolhe é a área de campos, que tem rolagem.
+        row = ctk.CTkFrame(self, fg_color="transparent")
+        row.pack(side="bottom", anchor="w", pady=6)
         box = TreeBox(self, ("cbo", "desc", "entrada", "deslig"),
                       (("cbo", "CBO", 80), ("desc", "Descrição", 280), ("entrada", "Entrada", 90),
                        ("deslig", "Desligamento", 100)), height=4)
         box.pack(fill="x", pady=4)
         self.tree = box.tree
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
-        self.scroll = ScrollFrame(self, height=330)
+        self.scroll = ScrollFrame(self, height=200)
         self.scroll.pack(fill="both", expand=True)
-        self.form = FormPanel(self.scroll, F21_VINC, per_row=4)
+        self.form = FormPanel(self.scroll, F21_VINC, per_row=4, actions={"cbo_cod": self.buscar_cbo})
         self.form.pack(anchor="w")
-        row = ctk.CTkFrame(self, fg_color="transparent")
-        row.pack(anchor="w", pady=6)
         button(row, "Adicionar vínculo", self.add).pack(side="left")
         button(row, "Atualizar selecionado", self.update_sel, kind="secondary").pack(side="left", padx=6)
         button(row, "Remover selecionado", self.remove, kind="danger").pack(side="left")
         button(row, "Limpar campos", self.form.clear, kind="secondary").pack(side="left", padx=6)
-        button(row, "Buscar CBO…", self.buscar_cbo, kind="secondary").pack(side="left", padx=(16, 0))
 
     def refresh(self):
         self.tree.delete(*self.tree.get_children())
@@ -551,7 +969,8 @@ class VinculosPanel(ctk.CTkFrame):
         if not base.available():
             messagebox.showinfo("Base CNES", "Importe a base CNES (aba “Base CNES”) para buscar CBO.", parent=self)
             return
-        found = CboSearch(self, base).run()
+        inicial = self.form.vars["cbo_cod"].get().strip() or self.form.vars["cbo_desc"].get().strip()
+        found = CboSearch(self, base, inicial).run()
         if found:
             self.form.vars["cbo_cod"].set(found[0])
             self.form.vars["cbo_desc"].set(found[1])
@@ -603,28 +1022,30 @@ class RegistroTab(ctk.CTkFrame):
         label(r2, "Descrição da alteração (vai para a planilha; ex.: Horário Ambulatorial):").pack(side="left")
         entry(r2, self.descr, 34).pack(side="left", padx=6)
 
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.pack(side="bottom", fill="x")       # empacotada antes: sempre visível, em qualquer altura
         self.nb = ctk.CTkTabview(self)
         self.nb.pack(fill="both", expand=True, pady=8)
         t1, t2, t3 = (self.nb.add(self.T_IDENT), self.nb.add(self.T_RESID), self.nb.add(self.T_VINC))
         sf1 = ScrollFrame(t1)
         sf1.pack(fill="both", expand=True)
-        self.f20a = FormPanel(sf1.inner, F20_IDENT, per_row=4)
+        label(sf1.inner, "Dica: digite o município (e a UF, se quiser) e clique na lupa para preencher "
+                         "o código IBGE e a UF pela base CNES.", anchor="w", font=font(12)
+              ).pack(anchor="w", padx=10, pady=(6, 0))
+        self.f20a = FormPanel(sf1.inner, F20_IDENT, per_row=4, actions={
+            "mun_nasc": lambda: self.lookup_mun("mun_nasc", "ibge_nasc", "uf_nasc")})
         self.f20a.pack(anchor="w", padx=4, pady=4)
-        button(sf1.inner, "Preencher IBGE/UF de nascimento pelo município (base CNES)",
-               lambda: self.lookup_mun("mun_nasc", "ibge_nasc", "uf_nasc"), kind="secondary"
-               ).pack(anchor="w", padx=10, pady=8)
         sf2 = ScrollFrame(t2)
         sf2.pack(fill="both", expand=True)
-        self.f20b = FormPanel(sf2.inner, F20_RESID + F20_BANCO, per_row=4)
+        label(sf2.inner, "Dica: digite o município (e a UF, se quiser) e clique na lupa para preencher "
+                         "o código IBGE e a UF pela base CNES.", anchor="w", font=font(12)
+              ).pack(anchor="w", padx=10, pady=(6, 0))
+        self.f20b = FormPanel(sf2.inner, F20_RESID + F20_BANCO, per_row=4, actions={
+            "mun_res": lambda: self.lookup_mun("mun_res", "ibge_res", "uf_res")})
         self.f20b.pack(anchor="w", padx=4, pady=4)
-        button(sf2.inner, "Preencher IBGE/UF de residência pelo município (base CNES)",
-               lambda: self.lookup_mun("mun_res", "ibge_res", "uf_res"), kind="secondary"
-               ).pack(anchor="w", padx=10, pady=8)
         self.vinc = VinculosPanel(t3, main)
         self.vinc.pack(fill="both", expand=True)
 
-        bar = ctk.CTkFrame(self, fg_color="transparent")
-        bar.pack(fill="x")
         button(bar, "Salvar e gerar PDFs", lambda: self.save(True)).pack(side="left")
         button(bar, "Salvar sem gerar", lambda: self.save(False), kind="secondary").pack(side="left", padx=8)
         button(bar, "Novo registro (limpar)", self.reset, kind="secondary").pack(side="left")
@@ -724,14 +1145,14 @@ class HistoricoTab(ctk.CTkFrame):
     def __init__(self, master, main: "MainFrame"):
         super().__init__(master, fg_color="transparent")
         self.main = main
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.pack(side="bottom", fill="x", pady=8)
         box = TreeBox(self, ("id", "comp", "op", "nome", "fichas", "envio"),
                       (("id", "Nº", 50), ("comp", "Competência", 100), ("op", "Operação", 90),
                        ("nome", "Profissional / descrição", 360), ("fichas", "Fichas", 90),
                        ("envio", "Envio", 90)), height=14)
         box.pack(fill="both", expand=True)
         self.tree = box.tree
-        bar = ctk.CTkFrame(self, fg_color="transparent")
-        bar.pack(fill="x", pady=8)
         for text, cmd, kind in (("Abrir para editar", self.edit, "primary"),
                                 ("Gerar PDFs novamente", self.regen, "secondary"),
                                 ("Abrir pasta de saída", self.open_folder, "secondary"),
@@ -823,19 +1244,20 @@ class PlanilhaTab(ctk.CTkFrame):
         ano.bind("<FocusOut>", lambda e: self.refresh())
         button(top, "Atualizar", self.refresh, kind="secondary").pack(side="left", padx=10)
         button(top, "Registrar alteração do estabelecimento…", self.add_estab_change).pack(side="right")
+        # rodapé empacotado primeiro (de baixo para cima) para nunca ser cortado
+        row2 = ctk.CTkFrame(self, fg_color="transparent")
+        row2.pack(side="bottom", fill="x")
+        row = ctk.CTkFrame(self, fg_color="transparent")
+        row.pack(side="bottom", fill="x", pady=6)
+        self.lbl = label(self, "", anchor="w")
+        self.lbl.pack(side="bottom", anchor="w")
         box = TreeBox(self, ("coluna", "texto", "envio"),
                       (("coluna", "Coluna da planilha", 160), ("texto", "Conteúdo", 460), ("envio", "Envio", 90)),
                       height=14)
         box.pack(fill="both", expand=True, pady=8)
         self.tree = box.tree
-        self.lbl = label(self, "", anchor="w")
-        self.lbl.pack(anchor="w")
-        row = ctk.CTkFrame(self, fg_color="transparent")
-        row.pack(fill="x", pady=6)
         label(row, "Observações:").pack(side="left")
         entry(row, self.obs, 64).pack(side="left", padx=6)
-        row2 = ctk.CTkFrame(self, fg_color="transparent")
-        row2.pack(fill="x")
         check(row2, "Adicionar como nova aba em uma planilha .xlsx existente", self.anexar).pack(side="left")
         button(row2, "Gerar planilha…", self.export).pack(side="right")
 
@@ -1045,15 +1467,22 @@ class MainFrame(ctk.CTkFrame):
         label(bar, f"Usuário: {app.session.nome}", font=font(13, True)).pack(side="left", padx=(12, 0), pady=8)
         label(bar, "Estabelecimento:").pack(side="left", padx=(24, 6))
         self.est_var = tk.StringVar()
-        self.est_cb = ctk.CTkComboBox(bar, variable=self.est_var, values=[""], state="readonly", width=430,
+        self.est_cb = ctk.CTkComboBox(bar, variable=self.est_var, values=[""], state="readonly", width=310,
                                       command=lambda v: self.refresh_lists())
         self.est_cb.pack(side="left")
         button(bar, "Editar", self.edit_estab, kind="secondary", width=70).pack(side="left", padx=(8, 0))
         button(bar, "Novo", self.new_estab, kind="secondary", width=70).pack(side="left", padx=6)
         button(bar, "Sair", app.logout, kind="danger", width=70).pack(side="right", padx=(8, 12))
+        conta = ["Alterar minha senha"] + (["Administração"] if app.session.is_admin else [])
+        self.conta = ctk.CTkOptionMenu(bar, values=conta, width=120, command=self._conta)
+        self.conta.set("Conta")
+        self.conta.pack(side="right", padx=(0, 8))
         theme_menu(bar, app).pack(side="right")
         label(bar, "Tema:").pack(side="right", padx=(0, 6))
 
+        self.alert = ctk.CTkLabel(self, text="", fg_color="#c0392b", text_color="white", corner_radius=6,
+                                  font=font(13, True), height=30)
+        self._bar = bar
         self.tabs = ctk.CTkTabview(self)
         self.tabs.pack(fill="both", expand=True, padx=8, pady=(4, 8))
         f_reg, f_his, f_pla, f_bas = (self.tabs.add(n) for n in
@@ -1065,6 +1494,24 @@ class MainFrame(ctk.CTkFrame):
         for tab in (self.registro, self.historico, self.planilha, self.base):
             tab.pack(fill="both", expand=True, padx=4, pady=4)
         self.load_estabs()
+
+    def _conta(self, choice: str):
+        self.conta.set("Conta")
+        if choice == "Alterar minha senha":
+            self.change_password()
+        elif choice == "Administração":
+            AdminDialog(self, self.app).run()
+
+    def change_password(self, forced: bool = False):
+        return PasswordDialog(self, self.app, forced).run()
+
+    def set_db_alert(self, msg: str | None):
+        """Faixa vermelha no topo enquanto o banco estiver inacessível."""
+        if msg:
+            self.alert.configure(text=msg)
+            self.alert.pack(fill="x", padx=8, pady=(8, 0), before=self._bar)
+        else:
+            self.alert.pack_forget()
 
     def _est_index(self) -> int:
         v = self.est_var.get()
@@ -1113,6 +1560,9 @@ class MainFrame(ctk.CTkFrame):
             self.load_estabs(rid)
 
 
+HEALTH_MS = 30_000    # intervalo da verificação de acesso ao banco
+
+
 class App(ctk.CTk):
     def __init__(self, db: Database | None = None):
         self.theme = settings.load().get("theme", "system")
@@ -1123,17 +1573,103 @@ class App(ctk.CTk):
         super().__init__()
         self.title(f"{APP_TITLE} – {APP_SUBTITLE}  v{__version__}")
         self.geometry("1180x800")
-        self.minsize(980, 660)
+        self.minsize(1100, 660)
         set_icon(self)
         style_native(self)
-        self.db = db or Database(app_db_path())
+        self.ok = True
+        self.db_ok, self.db_alert = True, None
+        self._hq: queue.Queue = queue.Queue()
+        self.db = db
+        if self.db is None and not self._connect_db():
+            self.ok = False
+            return
         self.cnes_base = cnes_import.CnesBase(cnes_db_path())
         self.service = Service(self.db, self.cnes_base, default_output_dir())
         self.session: Session | None = None
         self.container = ctk.CTkFrame(self, fg_color="transparent")
         self.container.pack(fill="both", expand=True)
+        self.report_callback_exception = self._on_error
+        self.show_start()
+        self.after(HEALTH_MS, self._health_tick)
+
+    # ------------------------------------------------------------- banco de dados
+    def _connect_db(self) -> bool:
+        """Abre o banco na pasta configurada; se estiver inacessível, oferece alternativas."""
+        while True:
+            path = app_db_path()
+            ok, msg = dbaccess.db_status(path)
+            if ok:
+                try:
+                    self.db = Database(path)
+                    return True
+                except sqlite3.Error as e:
+                    msg = f"Não foi possível abrir o banco:\n{e}"
+            choice = DbFailDialog(self, path, msg).run() or "exit"
+            if choice == "change":
+                DbLocationDialog(self, self).run()
+            elif choice == "default":
+                settings.save(db_dir="")
+            elif choice == "exit":
+                return False
+
+    def reconnect(self) -> None:
+        """Reabre o banco (após mudar a pasta). Encerra a sessão: o usuário pode não existir no novo banco."""
+        try:
+            if self.db is not None:
+                self.db.close()
+        except sqlite3.Error:
+            pass
+        self.db = None
+        if not self._connect_db():
+            self.destroy()
+            return
+        self.service = Service(self.db, self.cnes_base, default_output_dir())
+        self.db_ok, self.db_alert = True, None
         self.show_start()
 
+    def _health_tick(self):
+        if self.db is not None:
+            path = app_db_path()
+            threading.Thread(
+                target=lambda: self._hq.put(dbaccess.db_status(path, require_db=True, seconds=10)),
+                daemon=True).start()
+            self.after(1500, self._health_poll)
+        self.after(HEALTH_MS, self._health_tick)
+
+    def _health_poll(self):
+        try:
+            ok, msg = self._hq.get_nowait()
+        except queue.Empty:
+            self.after(1000, self._health_poll)
+            return
+        self.set_db_state(ok, msg)
+
+    def set_db_state(self, ok: bool, msg: str = "") -> None:
+        """Avisa o usuário quando o banco fica inacessível (e quando volta)."""
+        was_ok, self.db_ok = self.db_ok, ok
+        self.db_alert = None if ok else ("ATENÇÃO: banco de dados inacessível. Verifique a rede ou a pasta do banco; "
+                                         "o que você salvar agora pode falhar.")
+        main = self.current_main()
+        if main is not None:
+            main.set_db_alert(self.db_alert)
+        if was_ok and not ok:
+            messagebox.showwarning("Banco de dados", f"Não foi possível acessar o banco de dados em:\n"
+                                   f"{app_db_path()}\n\n{msg}\n\nVerifique a conexão com a pasta de rede. "
+                                   "A faixa vermelha some quando o acesso for restabelecido.", parent=self)
+
+    def current_main(self):
+        kids = self.container.winfo_children()
+        return kids[0] if kids and isinstance(kids[0], MainFrame) else None
+
+    def _on_error(self, exc, val, tb):
+        if isinstance(val, (sqlite3.Error, OSError)):
+            messagebox.showerror("Banco de dados", "Não foi possível concluir a operação no banco de dados.\n"
+                                 "Verifique a conexão com a pasta do banco e tente novamente.\n\n"
+                                 f"Detalhe: {val}", parent=self)
+        else:
+            super().report_callback_exception(exc, val, tb)
+
+    # ------------------------------------------------------------------ telas
     def set_theme(self, choice: str) -> None:
         """choice: 'Sistema' | 'Claro' | 'Escuro' (rótulo do menu)."""
         self.theme = THEMES.get(choice, "system")
@@ -1155,8 +1691,15 @@ class App(ctk.CTk):
         self._clear()
         main = MainFrame(self.container, self)
         main.pack(fill="both", expand=True)
+        main.set_db_alert(self.db_alert)
+        self.after(200, lambda: self._after_login(main))
+
+    def _after_login(self, main: "MainFrame"):
+        if self.session and self.session.trocar_senha and not main.change_password(forced=True):
+            self.show_start()      # não definiu a nova senha: volta ao login
+            return
         if not main.estabs:
-            self.after(200, lambda: main.new_estab(first=True))
+            main.new_estab(first=True)
 
     def logout(self):
         if messagebox.askyesno("Sair", "Encerrar a sessão?", parent=self):
@@ -1164,4 +1707,8 @@ class App(ctk.CTk):
 
 
 def run() -> None:
-    App().mainloop()
+    app = App()
+    if app.ok:
+        app.mainloop()
+    else:
+        app.destroy()

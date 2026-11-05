@@ -27,8 +27,34 @@ def data_dir() -> Path:
     return p
 
 
+DB_FILENAME = "flexcnes_app.db"
+
+
+def _config_file() -> Path:
+    return data_dir() / "config.json"
+
+
+def configured_db_dir() -> str:
+    """Pasta do banco definida pelo administrador (vazio = padrão). Guardada no config.json LOCAL
+    de cada computador, pois a localização do banco não pode ficar dentro do próprio banco."""
+    try:
+        import json
+        return str(json.loads(_config_file().read_text(encoding="utf-8")).get("db_dir", "") or "")
+    except Exception:
+        return ""
+
+
+def default_db_dir() -> Path:
+    return data_dir()
+
+
+def db_dir() -> Path:
+    custom = configured_db_dir()
+    return Path(custom) if custom else default_db_dir()
+
+
 def app_db_path() -> Path:
-    return data_dir() / "flexcnes_app.db"
+    return db_dir() / DB_FILENAME
 
 
 def cnes_db_path() -> Path:

@@ -262,6 +262,171 @@ class CnesTests(unittest.TestCase):
             self.assertFalse(cnes_import.CnesBase(Path(t) / "c.db").available())
 
 
+class UsersTests(unittest.TestCase):
+    def setUp(self):
+        from app.service import Service, Session
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self._tmp.name) / "u.db")
+        self.svc = Service(self.db, None, Path(self._tmp.name))
+        self.Session = Session
+        self.db.create_first_admin("admin", "Administrador", "senha-admin-1")
+        row = self.db.authenticate("admin", "senha-admin-1")
+        self.adm = Session(row["id"], row["usuario"], row["nome"], row["perfil"])
+
+    def tearDown(self):
+        self.db.close()
+        self._tmp.cleanup()
+
+    def test_primeiro_usuario_e_admin_e_so_uma_vez(self):
+        self.assertTrue(self.adm.is_admin)
+        with self.assertRaises(AuthError):
+            self.db.create_first_admin("outro", "Outro", "senha-outro-1")
+
+    def test_admin_gerencia_usuarios_comuns(self):
+        uid = self.svc.criar_usuario(self.adm, "ana", "Ana", "temporaria-1")
+        row = self.db.authenticate("ana", "temporaria-1")
+        self.assertEqual((row["perfil"], row["trocar_senha"]), ("COMUM", 1))
+        self.svc.editar_usuario(self.adm, uid, "ana.s", "Ana Souza", True)
+        self.assertEqual(self.db.get_user(uid)["usuario"], "ana.s")
+        self.svc.resetar_senha(self.adm, uid, "outra-temp-2")
+        with self.assertRaises(AuthError):
+            self.db.authenticate("ana.s", "temporaria-1")
+        self.assertEqual(self.db.authenticate("ana.s", "outra-temp-2")["trocar_senha"], 1)
+        with self.assertRaises(AuthError):       # login duplicado (sem diferenciar maiúsculas)
+            self.svc.criar_usuario(self.adm, "ANA.S", "Outra", "temporaria-1")
+        with self.assertRaises(AuthError):       # política de senha
+            self.svc.criar_usuario(self.adm, "x", "X", "curta")
+
+    def test_desativar_bloqueia_login(self):
+        uid = self.svc.criar_usuario(self.adm, "bia", "Bia", "temporaria-1")
+        self.svc.editar_usuario(self.adm, uid, "bia", "Bia", False)
+        with self.assertRaises(AuthError) as cm:
+            self.db.authenticate("bia", "temporaria-1")
+        self.assertIn("desativado", str(cm.exception))
+        with self.assertRaises(AuthError):       # senha errada não revela que está desativado
+            self.db.authenticate("bia", "errada")
+
+    def test_comum_nao_administra_e_admin_nao_edita_admin(self):
+        uid = self.svc.criar_usuario(self.adm, "caio", "Caio", "temporaria-1")
+        row = self.db.authenticate("caio", "temporaria-1")
+        comum = self.Session(row["id"], row["usuario"], row["nome"], row["perfil"])
+        for fn in (lambda: self.svc.listar_usuarios(comum),
+                   lambda: self.svc.criar_usuario(comum, "z", "Z", "temporaria-1"),
+                   lambda: self.svc.resetar_senha(comum, uid, "temporaria-2")):
+            with self.assertRaises(PermissionError):
+                fn()
+        with self.assertRaises(AuthError):
+            self.svc.resetar_senha(self.adm, self.adm.user_id, "temporaria-2")
+        with self.assertRaises(AuthError):
+            self.svc.editar_usuario(self.adm, self.adm.user_id, "admin", "Adm", False)
+
+    def test_admin_desativado_perde_poderes_mesmo_com_sessao_aberta(self):
+        self.db.conn.execute("UPDATE usuarios SET ativo=0 WHERE id=?", (self.adm.user_id,))
+        with self.assertRaises(PermissionError):
+            self.svc.listar_usuarios(self.adm)
+
+    def test_trocar_propria_senha(self):
+        uid = self.svc.criar_usuario(self.adm, "dora", "Dora", "temporaria-1")
+        row = self.db.authenticate("dora", "temporaria-1")
+        s = self.Session(row["id"], "dora", "Dora", "COMUM", True)
+        with self.assertRaises(AuthError):
+            self.svc.trocar_minha_senha(s, "errada", "definitiva-1")
+        with self.assertRaises(AuthError):
+            self.svc.trocar_minha_senha(s, "temporaria-1", "temporaria-1")
+        with self.assertRaises(AuthError):
+            self.svc.trocar_minha_senha(s, "temporaria-1", "curta")
+        self.svc.trocar_minha_senha(s, "temporaria-1", "definitiva-1")
+        self.assertFalse(s.trocar_senha)
+        self.assertEqual(self.db.authenticate("dora", "definitiva-1")["trocar_senha"], 0)
+        with self.assertRaises(AuthError):
+            self.db.authenticate("dora", "temporaria-1")
+
+    def test_migracao_de_banco_v01(self):
+        import sqlite3
+        f = Path(self._tmp.name) / "v01.db"
+        c = sqlite3.connect(f)
+        c.executescript("""CREATE TABLE usuarios (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            usuario TEXT NOT NULL UNIQUE COLLATE NOCASE, nome TEXT NOT NULL, senha_hash TEXT NOT NULL,
+            criado_em TEXT NOT NULL);""")
+        from app.security import hash_password
+        for i, u in enumerate(("primeiro", "segundo")):
+            c.execute("INSERT INTO usuarios(usuario,nome,senha_hash,criado_em) VALUES (?,?,?,?)",
+                      (u, u, hash_password("senha-antiga-1", iterations=1000), "2026-01-01"))
+        c.commit(); c.close()
+        db = Database(f)
+        perfis = {r["usuario"]: (r["perfil"], r["ativo"]) for r in db.list_users()}
+        db.close()
+        self.assertEqual(perfis, {"primeiro": ("ADMIN", 1), "segundo": ("COMUM", 1)})
+
+
+class DbAccessTests(unittest.TestCase):
+    def test_normalize_dir(self):
+        from app import dbaccess
+        self.assertEqual(dbaccess.normalize_dir('  "/dados/flex/"  '), "/dados/flex")
+        self.assertEqual(dbaccess.normalize_dir("relativo/pasta"), "")
+        self.assertEqual(dbaccess.normalize_dir(""), "")
+
+    def test_inspect_dir_e_status(self):
+        from app import dbaccess
+        from app.paths import DB_FILENAME
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(dbaccess.inspect_dir(t), {"ok": True, "has_db": False, "msg": ""})
+            self.assertTrue(dbaccess.db_status(Path(t) / DB_FILENAME)[0])
+            self.assertFalse(dbaccess.db_status(Path(t) / DB_FILENAME, require_db=True)[0])
+            self.assertFalse(dbaccess.inspect_dir(Path(t) / "nao_existe")["ok"])
+            (Path(t) / DB_FILENAME).write_text("isto não é um banco sqlite")
+            self.assertFalse(dbaccess.inspect_dir(t)["ok"])
+            (Path(t) / DB_FILENAME).unlink()
+            Database(Path(t) / DB_FILENAME).close()
+            self.assertEqual(dbaccess.inspect_dir(t), {"ok": True, "has_db": True, "msg": ""})
+            self.assertTrue(dbaccess.db_status(Path(t) / DB_FILENAME, require_db=True)[0])
+            self.assertEqual(list(Path(t).glob(".flexcnes_*")), [])   # arquivo de teste removido
+
+    def test_arquivo_no_lugar_da_pasta(self):
+        from app import dbaccess
+        with tempfile.NamedTemporaryFile() as f:
+            self.assertFalse(dbaccess.inspect_dir(f.name)["ok"])
+
+    def test_timeout(self):
+        import time
+        from app import dbaccess
+        self.assertEqual(dbaccess.with_timeout(lambda: time.sleep(2), 0.2, "estourou"), "estourou")
+        self.assertEqual(dbaccess.with_timeout(lambda: 7, 1, 0), 7)
+
+    def test_copy_db(self):
+        from app import dbaccess
+        from app.paths import DB_FILENAME
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            db = Database(Path(a) / "o.db")
+            db.create_first_admin("admin", "Adm", "senha-admin-1")
+            dst = dbaccess.copy_db(db.path, b)
+            db.close()
+            self.assertEqual(dst, Path(b) / DB_FILENAME)
+            c = Database(dst)
+            self.assertEqual(c.user_count(), 1)
+            c.close()
+            with self.assertRaises(FileExistsError):
+                dbaccess.copy_db(Path(a) / "o.db", b)
+
+    def test_config_do_caminho(self):
+        import os
+        from app import paths, settings
+        with tempfile.TemporaryDirectory() as t:
+            old = os.environ.get("FCNES_DATA_DIR")
+            os.environ["FCNES_DATA_DIR"] = t
+            try:
+                self.assertEqual(paths.app_db_path(), Path(t) / paths.DB_FILENAME)
+                self.assertTrue(settings.save(db_dir="/mnt/rede/flex"))
+                self.assertEqual(paths.app_db_path(), Path("/mnt/rede/flex") / paths.DB_FILENAME)
+                settings.save(db_dir="")
+                self.assertEqual(paths.app_db_path(), Path(t) / paths.DB_FILENAME)
+            finally:
+                if old is None:
+                    os.environ.pop("FCNES_DATA_DIR")
+                else:
+                    os.environ["FCNES_DATA_DIR"] = old
+
+
 class RegionalDbTests(unittest.TestCase):
     def test_regional_salva_e_migra_banco_antigo(self):
         import sqlite3

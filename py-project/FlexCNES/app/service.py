@@ -11,7 +11,8 @@ from typing import Any
 
 from . import pdf_fill, planilha
 from .cnes_import import CnesBase
-from .db import Database
+from .db import AuthError, Database
+from .security import password_problems
 from .validators import (MESES, format_date, is_blank_or_valid_date, only_digits, parse_date,
                          valid_cns, valid_cpf, valid_pis)
 
@@ -31,6 +32,12 @@ class Session:
     user_id: int
     usuario: str
     nome: str
+    perfil: str = "COMUM"
+    trocar_senha: bool = False       # senha temporária: obrigar troca no login
+
+    @property
+    def is_admin(self) -> bool:
+        return self.perfil == "ADMIN"
 
 
 @dataclass
@@ -59,6 +66,50 @@ class Service:
         self.db = db
         self.cnes = cnes_base
         self.out_root = Path(out_root)
+
+    # ---------------------------------------------------------------- usuários
+    def _admin(self, sess: Session) -> None:
+        """Confere no banco (e não na sessão) se quem chama ainda é um administrador ativo."""
+        row = self.db.get_user(sess.user_id)
+        if not row or row["perfil"] != "ADMIN" or not row["ativo"]:
+            raise PermissionError("Apenas o administrador pode realizar esta operação.")
+
+    def _alvo_comum(self, user_id: int):
+        row = self.db.get_user(user_id)
+        if not row:
+            raise AuthError("Usuário não encontrado.")
+        if row["perfil"] != "COMUM":
+            raise AuthError("O administrador só gerencia usuários comuns.")
+        return row
+
+    def listar_usuarios(self, sess: Session) -> list[dict]:
+        self._admin(sess)
+        return [dict(r) for r in self.db.list_users()]
+
+    def criar_usuario(self, sess: Session, usuario: str, nome: str, senha_temporaria: str) -> int:
+        """Cria usuário comum com senha temporária (a troca é exigida no primeiro login)."""
+        self._admin(sess)
+        probs = password_problems(senha_temporaria)
+        if probs:
+            raise AuthError(" ".join(probs))
+        return self.db.create_user(usuario, nome, senha_temporaria, perfil="COMUM", trocar_senha=True)
+
+    def editar_usuario(self, sess: Session, user_id: int, usuario: str, nome: str, ativo: bool) -> None:
+        self._admin(sess)
+        self._alvo_comum(user_id)
+        self.db.update_user(user_id, usuario, nome, ativo)
+
+    def resetar_senha(self, sess: Session, user_id: int, senha_temporaria: str) -> None:
+        self._admin(sess)
+        self._alvo_comum(user_id)
+        probs = password_problems(senha_temporaria)
+        if probs:
+            raise AuthError(" ".join(probs))
+        self.db.change_password(user_id, senha_temporaria, trocar_senha=True)
+
+    def trocar_minha_senha(self, sess: Session, atual: str, nova: str) -> None:
+        self.db.change_own_password(sess.user_id, atual, nova)
+        sess.trocar_senha = False
 
     # ---------------------------------------------------------------- validação
     def validar(self, form: dict[str, Any]) -> tuple[list[str], list[str]]:

@@ -35,6 +35,13 @@ class Widget:
         if master is not None and hasattr(master, "children"):
             master.children.append(self)
         self.opts = {}
+        self._packs, self.pack_kw = [], None
+
+    def pack(self, *a, **kw):
+        """Registra a ordem de empacotamento (para testar que botões ficam visíveis)."""
+        self.pack_kw = kw
+        if self.master is not None and hasattr(self.master, "_packs"):
+            self.master._packs.append(self)
 
     def __getattr__(self, name):
         if name.startswith("__"):
@@ -142,7 +149,7 @@ def install_fake_tk():
     ctk = types.ModuleType("customtkinter")
     for n in ("CTk", "CTkToplevel", "CTkFrame", "CTkLabel", "CTkButton", "CTkEntry", "CTkComboBox",
               "CTkCheckBox", "CTkRadioButton", "CTkScrollableFrame", "CTkProgressBar", "CTkOptionMenu",
-              "CTkScrollbar", "CTkFont"):
+              "CTkScrollbar", "CTkFont", "CTkImage"):
         setattr(ctk, n, type(n, (Widget,), {}))
     ctk.CTkTabview = Tabview
     ctk.MODE = ["system"]
@@ -153,7 +160,7 @@ def install_fake_tk():
     mb.showerror = lambda t, m, **k: log["errors"].append((t, m))
     mb.showinfo = lambda t, m, **k: log["infos"].append((t, m))
     mb.showwarning = lambda t, m, **k: log["warnings"].append((t, m))
-    mb.askyesno = lambda t, m, **k: (log["asks"].append((t, m)), False)[1]  # nunca abre pastas
+    mb.askyesno = lambda t, m, **k: (log["asks"].append((t, m)), fd.state.get("yes", False))[1]  # padrão: Não
     fd.state = {}
     fd.askopenfilename = lambda **k: fd.state.get("open", "")
     fd.asksaveasfilename = lambda **k: fd.state.get("save", "")
@@ -178,7 +185,10 @@ def check(cond, msg):
 
 
 def main():
+    import os
     tmp = Path(tempfile.mkdtemp())
+    os.environ["FCNES_DATA_DIR"] = str(tmp / "dados")   # isola config.json dos testes
+    gui.SYNC_ASYNC = True
     db = Database(tmp / "app.db")
     gui.cnes_db_path = lambda: tmp / "cnes.db"
     app = gui.App(db)
@@ -337,8 +347,190 @@ def main():
     auth.pw.set("senha-forte-1"); auth.submit()
     check(app.session is not None and app.container.children[0].estabs, "login correto reabre com estabelecimento salvo")
 
+    new_features(app, tmp)
+
     print("\nFALHAS:", len(failures))
     return 1 if failures else 0
+
+
+def new_features(app, tmp):
+    from app import dbaccess, paths, settings
+    sess = app.session
+    main_f = app.container.children[0]
+
+    print("9) administrador e usuários")
+    check(sess.is_admin and sess.perfil == "ADMIN", "primeiro usuário é administrador")
+    check(main_f.conta.kw.get("values") == ["Alterar minha senha", "Administração"], "menu Conta do administrador")
+    dlg = gui.UserDialog(main_f, app)
+    dlg.usuario.set("joao"); dlg.nome.set("João Comum"); dlg.senha.set("temp-12345"); dlg.conf.set("outra")
+    dlg.salvar()
+    check("confirmação" in LOG["errors"][-1][1], "senha temporária precisa de confirmação")
+    dlg.conf.set("temp-12345"); dlg.salvar()
+    check(dlg.result and any(u["usuario"] == "joao" for u in app.service.listar_usuarios(sess)), "administrador cadastra usuário")
+    adm = gui.AdminDialog(main_f, app)
+    check(len(adm.tree.rows) == 2, "lista de usuários na administração")
+    adm.tree.selection_set(next(i for i, u in adm.rows.items() if u["usuario"] == "joao"))
+    row = adm._selected()
+    ed = gui.UserDialog(main_f, app, row)
+    ed.nome.set("João da Silva"); ed.salvar()
+    check(app.db.get_user(row["id"])["nome"] == "João da Silva", "administrador edita usuário")
+    rp = gui.ResetPasswordDialog(main_f, app, row)
+    rp.senha.set("nova-senha-9"); rp.conf.set("nova-senha-9"); rp.salvar()
+    check(app.db.authenticate("joao", "nova-senha-9")["trocar_senha"] == 1, "redefinição exige troca no próximo login")
+    adm.tree.selection_set(next(i for i, u in adm.rows.items() if u["perfil"] == "ADMIN"))
+    check(adm._selected() is None, "administrador não é editável pela lista")
+
+    print("10) usuário comum e troca de senha")
+    app.show_start()
+    auth = app.container.children[0]
+    auth.user.set("joao"); auth.pw.set("nova-senha-9"); auth.submit()
+    check(app.session and not app.session.is_admin and app.session.trocar_senha, "login do comum com senha temporária")
+    main_c = app.container.children[0]
+    check(main_c.conta.kw.get("values") == ["Alterar minha senha"], "comum não vê Administração")
+    app._after_login(main_c)
+    check(app.session is None, "sem trocar a senha temporária, volta ao login")
+    auth = app.container.children[0]
+    auth.user.set("joao"); auth.pw.set("nova-senha-9"); auth.submit()
+    main_c = app.container.children[0]
+    pd = gui.PasswordDialog(main_c, app, forced=True)
+    pd.atual.set("errada"); pd.nova.set("definitiva-1"); pd.conf.set("definitiva-1"); pd.salvar()
+    check("atual" in LOG["errors"][-1][1] and not pd.result, "troca recusa senha atual incorreta")
+    pd.atual.set("nova-senha-9"); pd.salvar()
+    check(pd.result and not app.session.trocar_senha, "troca de senha com a senha atual")
+    try:
+        app.service.listar_usuarios(app.session)
+        denied = False
+    except PermissionError:
+        denied = True
+    check(denied, "comum não acessa funções de administrador")
+    app.show_start()
+    auth = app.container.children[0]
+    auth.user.set("joao"); auth.pw.set("nova-senha-9"); auth.submit()
+    check(app.session is None, "senha antiga deixa de valer")
+    auth.pw.set("definitiva-1"); auth.submit()
+    check(app.session is not None and not app.session.trocar_senha, "login com a nova senha")
+
+    print("11) lupa nos municípios")
+    kinds = {k: kd for (k, _, kd, _, _) in gui.F20_IDENT + gui.F20_RESID}
+    widths = {k: w for (k, _, _, w, _) in gui.F20_IDENT + gui.F20_RESID}
+    check(kinds["mun_nasc"] == "search" and kinds["mun_res"] == "search", "campos de município usam a lupa")
+    check(widths["mun_nasc"] < 28 and widths["mun_res"] < 28, "campos de município menores")
+    main_c = app.container.children[0]
+    hits = []
+    gui.FormPanel(main_c, gui.F20_RESID, 4, actions={"mun_res": lambda: hits.append(1)})
+    check(gui.search_icon() is not None, "ícone de lupa carregável")
+    from pathlib import Path as _P
+    check((_P(gui.__file__).parent.parent / "assets" / "icons" / "search_dark.png").exists(), "arquivos da lupa existem")
+
+    print("12) local do banco de dados")
+    check(paths.configured_db_dir() == "" and paths.app_db_path().parent == paths.default_db_dir(), "caminho padrão por omissão")
+    changed = []
+    panel = gui.DbLocationPanel(main_c, app, lambda: changed.append(1))
+    app.session = sess  # administrador
+    dest = tmp / "rede" / "FlexCNES"
+    dest.mkdir(parents=True)
+    panel.var.set(str(dest))
+    panel.test()
+    check("Acesso OK" in panel.status.opts.get("text", ""), "teste de acesso a pasta válida")
+    panel.var.set(str(tmp / "nao_existe"))
+    n = len(LOG["errors"]); panel.test()
+    check(len(LOG["errors"]) == n + 1, "pasta inexistente é recusada no teste")
+    panel.var.set("relativo/pasta"); n = len(LOG["errors"]); panel.apply()
+    check(len(LOG["errors"]) == n + 1, "caminho não absoluto é recusado")
+    panel.var.set(str(dest)); FD.state["yes"] = False; panel.apply()
+    check(not changed and paths.configured_db_dir() == "", "recusar a cópia cancela a mudança")
+    FD.state["yes"] = True; panel.apply()
+    check(changed == [1] and paths.configured_db_dir() == str(dest), "copia o banco e grava a nova pasta")
+    check((dest / paths.DB_FILENAME).exists(), "banco copiado para a pasta nova")
+    copia = Database(dest / paths.DB_FILENAME)
+    check(copia.user_count() == app.db.user_count(), "cópia contém os mesmos usuários")
+    copia.close()
+    check(paths.app_db_path() == dest / paths.DB_FILENAME, "app passa a usar o banco da pasta nova")
+    panel.var.set(str(paths.default_db_dir())); changed.clear(); panel.apply()
+    check(changed == [1] and paths.configured_db_dir() == "", "restaurar o padrão")
+
+    print("13) acesso ao banco: aviso e falha na abertura")
+    main_c = app.container.children[0]
+    w0 = len(LOG["warnings"])
+    app.set_db_state(False, "sem rede")
+    check(len(LOG["warnings"]) == w0 + 1 and app.db_alert and not app.db_ok, "aviso quando o banco fica inacessível")
+    app.set_db_state(False, "sem rede")
+    check(len(LOG["warnings"]) == w0 + 1, "aviso não se repete enquanto continua inacessível")
+    app.set_db_state(True)
+    check(app.db_alert is None and app.db_ok, "faixa some quando o acesso volta")
+    settings.save(db_dir=str(tmp / "offline"))
+    escolhas = iter(["retry", "default"])
+
+    class FakeFail:
+        def __init__(self, *a, **k): pass
+        def run(self): return next(escolhas)
+    orig = gui.DbFailDialog
+    gui.DbFailDialog = FakeFail
+    try:
+        app.db.close()
+        ok = app._connect_db()
+    finally:
+        gui.DbFailDialog = orig
+    check(ok and paths.configured_db_dir() == "", "falha na abertura: tentar de novo e usar o padrão")
+    escolhas = iter(["exit"])
+    settings.save(db_dir=str(tmp / "offline"))
+    gui.DbFailDialog = FakeFail
+    try:
+        check(app._connect_db() is False, "falha na abertura: sair")
+    finally:
+        gui.DbFailDialog = orig
+        settings.save(db_dir="")
+
+    print("14) botões sempre visíveis e busca de CBO pela lupa")
+
+    def ordem(frame):
+        return [(c.pack_kw or {}) for c in frame._packs if c.pack_kw is not None]
+
+    def bottom_before_expand(frame):
+        kws = ordem(frame)
+        bottoms = [i for i, k in enumerate(kws) if k.get("side") == "bottom"]
+        expands = [i for i, k in enumerate(kws) if k.get("expand")]
+        return bool(bottoms) and bool(expands) and max(bottoms) < min(expands)
+    main_f = app.container.children[0]
+    reg = main_f.registro
+    check(bottom_before_expand(reg), "Registro: barra Salvar/Gerar/Limpar empacotada antes da área expansível")
+    check(bottom_before_expand(reg.vinc), "Vínculos: botões Adicionar/Salvar empacotados antes da área expansível")
+    check(bottom_before_expand(main_f.historico), "Histórico: barra de botões ancorada embaixo")
+    check(bottom_before_expand(main_f.planilha), "Planilha: rodapé ancorado embaixo")
+    def textos(w):
+        yield w.kw.get("text")
+        for c in w.children:
+            yield from textos(c)
+    todos = [str(t) for t in textos(reg.vinc)]
+    check("Adicionar vínculo" in todos and "Atualizar selecionado" in todos, "botões de vínculo existem")
+    check(not any("Buscar CBO" in t for t in todos), "botão grande 'Buscar CBO…' substituído pela lupa")
+    kinds = {k: kd for (k, _, kd, _, _) in gui.F21_VINC}
+    check(kinds["cbo_cod"] == "search_left", "lupa antes do campo de código do CBO")
+    vp = reg.vinc
+    vp.form.vars["cbo_cod"].set("2235"); vp.form.vars["cbo_desc"].set("")
+    vistos = []
+
+    class FakeCbo:
+        def __init__(self, master, base, inicial=""):
+            vistos.append(inicial)
+
+        def run(self):
+            return ("223505", "ENFERMEIRO")
+    orig = gui.CboSearch
+    gui.CboSearch = FakeCbo
+    try:
+        vp.buscar_cbo()
+    finally:
+        gui.CboSearch = orig
+    check(vistos == ["2235"], "busca abre já com o código digitado")
+    check(vp.form.vars["cbo_cod"].get() == "223505" and vp.form.vars["cbo_desc"].get() == "ENFERMEIRO",
+          "resultado preenche código e descrição")
+    cs = gui.CboSearch(main_f, app.cnes_base, "enferm")
+    check(any(c == "223505" for c, _ in cs.items), "busca por descrição")
+    cs.q.set("2235"); cs.refresh()
+    check([c for c, _ in cs.items] == ["223505"], "busca por código")
+    cs.pick(first=True)
+    check(cs.result == ("223505", "ENFERMEIRO"), "Enter com resultado único usa direto")
 
 
 if __name__ == "__main__":

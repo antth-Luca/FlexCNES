@@ -19,10 +19,12 @@ def load() -> dict:
         return {}
 
 
-def save(**kv) -> None:
+def save(**kv) -> bool:
+    """Grava preferências; devolve False se não conseguiu gravar (ex.: sem permissão)."""
     try:
         cfg = load()
         cfg.update(kv)
         _file().write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
     except Exception:
-        pass
+        return False

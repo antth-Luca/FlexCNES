@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .security import hash_password, verify_password
+from .security import hash_password, password_problems, verify_password
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS usuarios (
@@ -15,7 +15,10 @@ CREATE TABLE IF NOT EXISTS usuarios (
     usuario TEXT NOT NULL UNIQUE COLLATE NOCASE,
     nome TEXT NOT NULL,
     senha_hash TEXT NOT NULL,
-    criado_em TEXT NOT NULL
+    criado_em TEXT NOT NULL,
+    perfil TEXT NOT NULL DEFAULT 'COMUM',      -- ADMIN | COMUM
+    ativo INTEGER NOT NULL DEFAULT 1,
+    trocar_senha INTEGER NOT NULL DEFAULT 0    -- 1 após redefinição pelo administrador
 );
 CREATE TABLE IF NOT EXISTS estabelecimentos (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,6 +61,9 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+PERFIS = ('ADMIN', 'COMUM')
+
+
 class AuthError(Exception):
     pass
 
@@ -65,7 +71,8 @@ class AuthError(Exception):
 class Database:
     def __init__(self, path: str | Path):
         self.path = str(path)
-        self.conn = sqlite3.connect(self.path)
+        # timeout alto: com o banco em pasta de rede, outro computador pode estar gravando
+        self.conn = sqlite3.connect(self.path, timeout=20)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
@@ -73,6 +80,15 @@ class Database:
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(estabelecimentos)")}
         if "regional" not in cols:
             self.conn.execute("ALTER TABLE estabelecimentos ADD COLUMN regional TEXT DEFAULT ''")
+        ucols = {r[1] for r in self.conn.execute("PRAGMA table_info(usuarios)")}
+        for col, ddl in (("perfil", "TEXT NOT NULL DEFAULT 'COMUM'"),
+                         ("ativo", "INTEGER NOT NULL DEFAULT 1"),
+                         ("trocar_senha", "INTEGER NOT NULL DEFAULT 0")):
+            if col not in ucols:
+                self.conn.execute(f"ALTER TABLE usuarios ADD COLUMN {col} {ddl}")
+        # bancos da v0.1: o primeiro usuário criado era o administrador
+        if not self.conn.execute("SELECT 1 FROM usuarios WHERE perfil='ADMIN'").fetchone():
+            self.conn.execute("UPDATE usuarios SET perfil='ADMIN' WHERE id=(SELECT MIN(id) FROM usuarios)")
         self.conn.commit()
 
     def close(self) -> None:
@@ -82,20 +98,33 @@ class Database:
     def user_count(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM usuarios").fetchone()[0]
 
-    def create_user(self, usuario: str, nome: str, senha: str) -> int:
+    def ping(self) -> None:
+        self.conn.execute("SELECT 1").fetchone()
+
+    def create_user(self, usuario: str, nome: str, senha: str, perfil: str = "COMUM",
+                    trocar_senha: bool = False) -> int:
         usuario = usuario.strip()
         nome = nome.strip()
         if not usuario or not nome:
             raise AuthError("Informe o nome e o usuário.")
+        if perfil not in PERFIS:
+            raise AuthError("Perfil inválido.")
         try:
             cur = self.conn.execute(
-                "INSERT INTO usuarios(usuario, nome, senha_hash, criado_em) VALUES (?,?,?,?)",
-                (usuario, nome, hash_password(senha), _now()),
+                "INSERT INTO usuarios(usuario, nome, senha_hash, criado_em, perfil, trocar_senha)"
+                " VALUES (?,?,?,?,?,?)",
+                (usuario, nome, hash_password(senha), _now(), perfil, int(trocar_senha)),
             )
         except sqlite3.IntegrityError as e:
             raise AuthError("Já existe um usuário com esse login.") from e
         self.conn.commit()
         return cur.lastrowid
+
+    def create_first_admin(self, usuario: str, nome: str, senha: str) -> int:
+        """Cria o administrador no primeiro acesso (só se ainda não houver usuários)."""
+        if self.user_count() > 0:
+            raise AuthError("Já existe usuário cadastrado neste banco. Entre com o seu login.")
+        return self.create_user(usuario, nome, senha, perfil="ADMIN")
 
     def authenticate(self, usuario: str, senha: str) -> sqlite3.Row:
         row = self.conn.execute(
@@ -106,13 +135,44 @@ class Database:
         ok = verify_password(senha, stored)
         if not row or not ok:
             raise AuthError("Usuário ou senha incorretos.")
+        if not row["ativo"]:
+            raise AuthError("Usuário desativado. Procure o administrador.")
         return row
 
-    def change_password(self, user_id: int, nova: str) -> None:
-        self.conn.execute(
-            "UPDATE usuarios SET senha_hash=? WHERE id=?", (hash_password(nova), user_id)
-        )
+    def get_user(self, user_id: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM usuarios WHERE id=?", (user_id,)).fetchone()
+
+    def list_users(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM usuarios ORDER BY perfil, nome COLLATE NOCASE").fetchall()
+
+    def update_user(self, user_id: int, usuario: str, nome: str, ativo: bool) -> None:
+        usuario, nome = usuario.strip(), nome.strip()
+        if not usuario or not nome:
+            raise AuthError("Informe o nome e o usuário.")
+        try:
+            self.conn.execute("UPDATE usuarios SET usuario=?, nome=?, ativo=? WHERE id=?",
+                              (usuario, nome, int(ativo), user_id))
+        except sqlite3.IntegrityError as e:
+            raise AuthError("Já existe um usuário com esse login.") from e
         self.conn.commit()
+
+    def change_password(self, user_id: int, nova: str, trocar_senha: bool = False) -> None:
+        """Define a senha sem conferir a atual (uso interno/administrativo)."""
+        self.conn.execute("UPDATE usuarios SET senha_hash=?, trocar_senha=? WHERE id=?",
+                          (hash_password(nova), int(trocar_senha), user_id))
+        self.conn.commit()
+
+    def change_own_password(self, user_id: int, atual: str, nova: str) -> None:
+        row = self.get_user(user_id)
+        if not row or not verify_password(atual, row["senha_hash"]):
+            raise AuthError("A senha atual está incorreta.")
+        if atual == nova:
+            raise AuthError("A nova senha deve ser diferente da atual.")
+        probs = password_problems(nova)
+        if probs:
+            raise AuthError(" ".join(probs))
+        self.change_password(user_id, nova, trocar_senha=False)
 
     # -------------------------------------------------------- estabelecimentos
     def list_estabelecimentos(self) -> list[sqlite3.Row]:

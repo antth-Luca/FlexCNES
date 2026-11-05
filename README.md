@@ -1,4 +1,4 @@
-<p align="center"><img alt="FlexCNES logo" src="https://github.com/antth-Luca/FlexCNES/blob/v0.1.0/repo-icon.png" width="160"></p>
+<p align="center"><img alt="FlexCNES logo" src="https://github.com/antth-Luca/FlexCNES/blob/v0.2.0/repo-icon.png" width="160"></p>
 
 # FlexCNES — Assistente de preenchimento de fichas e planilha CNES
 
@@ -11,14 +11,22 @@ Aplicativo desktop (Python + CustomTkinter + SQLite), com tema Sistema/Claro/Esc
     python main.py
 (Tkinter vem com o Python do Windows/macOS; no Linux: `sudo apt install python3-tk`.)
 
-## Como funciona
-1. **Primeiro acesso**: cria usuário e senha (mín. 8 caracteres; PBKDF2-SHA256 com salt). Depois, só usuário logado preenche documentos.
-2. **Estabelecimento**: cadastrado uma vez (CNES, nome fantasia, município...), editável depois e reutilizado.
-3. **Base CNES (opcional)**: menu para importar o ZIP do DATASUS; com ela, basta digitar o CNES para preencher o estabelecimento, e municípios/CBO são pesquisáveis.
-4. Histórico dos registros, edição e regeração.
-5. A planilha sai em .xlsx; se o **LibreOffice** estiver instalado, também é convertida para .xls.
+## Como funciona?
+1. **Primeiro acesso**: cria usuário administrador. Ele que cadastra, edita e desativa outros usuários.
+2. **Usuários gerais**: no primeiro acesso, define uma senha definitiva. Somente usuário logado preenche documentos. Cada usuário pode resetar sua própria senha.
+3. **Base CNES (opcional, mas recomendado)**: menu para importar o ZIP do DATASUS; com ela, basta digitar o CNES para preencher o estabelecimento e a busca por municípios e CBOs é ativada.
+4. **O estabelecimento**: cadastrado uma vez (CNES, nome fantasia, município, regional de saúde...), reutilizado em cada geração e ainda é editável.
+5. **Fichas e Planilha**: Fichas podem ser geradas logo após o preenchimento, mas há histórico dos registros, edição e regeração. A planilha é gerada depois e sai em .xlsx (se o **LibreOffice** estiver instalado, também é convertida para .xls).
 
-Dados ficam em SQLite na pasta do usuário. Testes: `python tests/test_core.py` e `python tests/smoke_gui.py`.
+Dados ficam em SQLite, por padrão `%APPDATA%\FlexCNES_Preenchimento`, mas um diretório customizado pode ser especificado pelo administrador. Cada computador guarda essa escolha no seu próprio `config.json`.
+
+> [!NOTE]
+> O SQLite em pasta de rede é possível, mas funciona para poucos usuários simultâneos. Evite sincronizadores (OneDrive/Dropbox) na pasta do banco e faça cópias de segurança da pasta com frequência.
+> A base CNES importada continua local.
+
+## Testes
+    python tests/test_core.py
+    python tests/smoke_gui.py    # usa um Tkinter simulado; não substitui um teste visual no Windows
 
 ## Gerar EXE (no Windows)
     pip install -r requirements.txt pyinstaller
