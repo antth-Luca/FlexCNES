@@ -525,6 +525,26 @@ def new_features(app, tmp):
     check(vistos == ["2235"], "busca abre já com o código digitado")
     check(vp.form.vars["cbo_cod"].get() == "223505" and vp.form.vars["cbo_desc"].get() == "ENFERMEIRO",
           "resultado preenche código e descrição")
+    # 15) Vinculação / Tipo / Sub-tipo em cascata + CNPJ
+    vp.limpar()
+    vp.form.vars["vinc_sel"].set("01 - VÍNCULO EMPREGATÍCIO")
+    check(vp.form.vars["tipo_sel"].get() == "", "troca de vinculação limpa o tipo")
+    vp.form.vars["tipo_sel"].set("01 - ESTATUTÁRIO EFETIVO")
+    check(vp.form.vars["sub_sel"].get() == "", "troca de tipo limpa o sub-tipo")
+    vp.form.vars["sub_sel"].set("02 - SERVIDOR CEDIDO")
+    vp.form.vars["cbo_cod"].set("223505"); vp.form.vars["cbo_desc"].set("ENFERMEIRO")
+    n0 = len(vp.vinculos)
+    vp.add()
+    check(len(vp.vinculos) == n0, "combinação com CNPJ obrigatório bloqueia sem CNPJ")
+    vp.form.vars["cnpj_vinc"].set("11222333000181")
+    vp.add()
+    v = vp.vinculos[-1]
+    check((v["vinc_cod"], v["tipo_cod"], v["sub_cod"]) == ("01", "01", "02"), "códigos gravados nas 6 chaves")
+    check(v["sub_desc"] == "SERVIDOR CEDIDO" and v["cnpj_vinc"] == "11.222.333/0001-81", "descrição e CNPJ formatado")
+    vp.on_select() if False else None
+    vp._load(v)
+    check(vp.form.vars["sub_sel"].get() == "02 - SERVIDOR CEDIDO", "edição recarrega os combos")
+
     cs = gui.CboSearch(main_f, app.cnes_base, "enferm")
     check(any(c == "223505" for c, _ in cs.items), "busca por descrição")
     cs.q.set("2235"); cs.refresh()

@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .security import hash_password, password_problems, verify_password
 
 SCHEMA = """
@@ -68,12 +69,44 @@ class AuthError(Exception):
     pass
 
 
+# Versão do ESQUEMA do banco (não é a versão do programa). Só sobe quando a estrutura muda.
+# 1 = FlexCNES 0.1.x (sem registro de versão); 2 = 0.2.x (perfis, regional, versão registrada).
+SCHEMA_VERSION = 2
+
+
+class DbVersionError(Exception):
+    """O banco foi atualizado por um FlexCNES mais novo que este programa."""
+
+    def __init__(self, db_schema: int, db_app: str, app_version: str):
+        self.db_schema, self.db_app, self.app_version = db_schema, db_app, app_version
+        super().__init__(
+            f"Este banco foi atualizado pelo FlexCNES {db_app or '(versão desconhecida)'} "
+            f"(esquema {db_schema}), mais novo que este programa (FlexCNES {app_version}, "
+            f"esquema {SCHEMA_VERSION}).\nAtualize o FlexCNES neste computador para usar este banco.")
+
+
+class DbMigrationNeeded(Exception):
+    """Banco de versão anterior: precisa de confirmação antes de ser atualizado."""
+
+    def __init__(self, db_schema: int, db_app: str, app_version: str):
+        self.db_schema, self.db_app, self.app_version = db_schema, db_app, app_version
+        super().__init__(
+            f"Este banco foi criado por uma versão anterior do FlexCNES (esquema {db_schema}). "
+            f"Para usá-lo, ele será atualizado para o esquema {SCHEMA_VERSION} (FlexCNES {app_version}).")
+
+
 class Database:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, allow_migrate: bool = False):
         self.path = str(path)
+        self.backup_path: str | None = None
         # timeout alto: com o banco em pasta de rede, outro computador pode estar gravando
         self.conn = sqlite3.connect(self.path, timeout=20)
         self.conn.row_factory = sqlite3.Row
+        try:
+            self._check_version(allow_migrate)
+        except Exception:
+            self.conn.close()
+            raise
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
         # migração: bancos criados antes da coluna "regional"
@@ -89,7 +122,77 @@ class Database:
         # bancos da v0.1: o primeiro usuário criado era o administrador
         if not self.conn.execute("SELECT 1 FROM usuarios WHERE perfil='ADMIN'").fetchone():
             self.conn.execute("UPDATE usuarios SET perfil='ADMIN' WHERE id=(SELECT MIN(id) FROM usuarios)")
+        self._register_version()
         self.conn.commit()
+
+    # ---------------------------------------------------------------- versão
+    def _read_state(self) -> tuple[bool, int, str]:
+        """(tem_dados, esquema, versão_do_programa_que_atualizou) sem alterar nada."""
+        tem = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='usuarios'").fetchone() is not None
+        if not tem:
+            return False, SCHEMA_VERSION, ""
+        schema, app = 1, ""
+        has_cfg = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='config'").fetchone()
+        if has_cfg:
+            rows = dict(self.conn.execute(
+                "SELECT chave, valor FROM config WHERE chave IN ('schema_version','ultimo_acesso_versao','criado_pela_versao')"
+            ).fetchall())
+            try:
+                schema = int(rows.get("schema_version") or 1)
+            except ValueError:
+                schema = 1
+            app = rows.get("ultimo_acesso_versao") or rows.get("criado_pela_versao") or ""
+        return True, schema, app
+
+    def _check_version(self, allow_migrate: bool) -> None:
+        tem, schema, app = self._read_state()
+        if not tem:
+            return
+        if schema > SCHEMA_VERSION:
+            raise DbVersionError(schema, app, __version__)
+        if schema < SCHEMA_VERSION:
+            if not allow_migrate:
+                raise DbMigrationNeeded(schema, app, __version__)
+            self._backup(schema)
+
+    def _backup(self, schema: int) -> None:
+        """Cópia de segurança do arquivo antes de migrar (ao lado do banco)."""
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        dest = f"{self.path}.bak-esquema{schema}-{stamp}"
+        dst = sqlite3.connect(dest)
+        try:
+            self.conn.backup(dst)
+        finally:
+            dst.close()
+        self.backup_path = dest
+
+    def _register_version(self) -> None:
+        import socket
+        cfg = {r["chave"] for r in self.conn.execute("SELECT chave FROM config")}
+        now = _now()
+        if "criado_pela_versao" not in cfg:
+            self.set_config("criado_pela_versao", __version__, commit=False)
+            self.set_config("criado_em", now, commit=False)
+        self.set_config("schema_version", str(SCHEMA_VERSION), commit=False)
+        self.set_config("ultimo_acesso_versao", __version__, commit=False)
+        self.set_config("ultimo_acesso_em", now, commit=False)
+        try:
+            self.set_config("ultimo_acesso_maquina", socket.gethostname(), commit=False)
+        except OSError:
+            pass
+
+    def version_info(self) -> dict[str, str]:
+        return {
+            "programa": __version__,
+            "esquema_programa": str(SCHEMA_VERSION),
+            "esquema_banco": self.get_config("schema_version", "?"),
+            "criado_pela_versao": self.get_config("criado_pela_versao", "(anterior à 0.2.0)"),
+            "ultimo_acesso_versao": self.get_config("ultimo_acesso_versao", ""),
+            "ultimo_acesso_em": self.get_config("ultimo_acesso_em", ""),
+            "ultimo_acesso_maquina": self.get_config("ultimo_acesso_maquina", ""),
+        }
 
     def close(self) -> None:
         self.conn.close()
@@ -296,10 +399,11 @@ class Database:
         row = self.conn.execute("SELECT valor FROM config WHERE chave=?", (chave,)).fetchone()
         return row["valor"] if row and row["valor"] is not None else default
 
-    def set_config(self, chave: str, valor: str) -> None:
+    def set_config(self, chave: str, valor: str, commit: bool = True) -> None:
         self.conn.execute(
             "INSERT INTO config(chave,valor) VALUES(?,?) "
             "ON CONFLICT(chave) DO UPDATE SET valor=excluded.valor",
             (chave, valor),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()

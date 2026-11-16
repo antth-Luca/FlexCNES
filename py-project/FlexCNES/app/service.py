@@ -9,7 +9,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from . import pdf_fill, planilha
+from . import pdf_fill, planilha, vinculos
 from .cnes_import import CnesBase
 from .db import AuthError, Database
 from .security import password_problems
@@ -162,6 +162,14 @@ class Service:
                 for k, label in DATE_LABELS_VINC.items():
                     if not is_blank_or_valid_date(v.get(k)):
                         erros.append(f"Vínculo {i} – {label}: data inválida (use dd/mm/aaaa).")
+                vc, tc, sc = (v.get("vinc_cod") or "").strip(), (v.get("tipo_cod") or "").strip(), (v.get("sub_cod") or "").strip()
+                if vc or tc or sc:
+                    if not vinculos.achar(vc, tc, sc):
+                        avisos.append(f"Vínculo {i}: Vinculação/Tipo/Sub-tipo fora da tabela da Portaria 1.130/2017.")
+                    elif vinculos.exige_cnpj(vc, tc, sc) and not vinculos.valid_cnpj(v.get("cnpj_vinc")):
+                        erros.append(f"Vínculo {i}: esta combinação exige CNPJ válido (14 dígitos).")
+                    elif (v.get("cnpj_vinc") or "").strip() and not vinculos.valid_cnpj(v.get("cnpj_vinc")):
+                        erros.append(f"Vínculo {i}: CNPJ inválido.")
                 cbo = (v.get("cbo_cod") or "").strip()
                 if cbo and not re.fullmatch(r"\d{6}", cbo):
                     avisos.append(f"Vínculo {i}: o CBO costuma ter 6 dígitos.")

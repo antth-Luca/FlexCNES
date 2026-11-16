@@ -170,15 +170,17 @@ def _dados(r: dict[str, Any]) -> dict[str, Any]:
 
 
 def _categoria(dados: dict[str, Any]) -> str:
-    """Categoria profissional da planilha: campo informado; senão a descrição (ou código) do 1º CBO."""
+    """Categoria profissional da planilha: campo informado; senão "código - descrição" do 1º CBO."""
     cat = str(dados.get("categoria_prof") or "").strip()
     if cat:
         return cat
     for v in dados.get("vinculos") or []:
-        if (v.get("cbo_desc") or "").strip():
-            return v["cbo_desc"].strip().title()
-        if (v.get("cbo_cod") or "").strip():
-            return f"CBO: {v['cbo_cod'].strip()}"
+        cod = (v.get("cbo_cod") or "").strip()
+        desc = (v.get("cbo_desc") or "").strip()
+        if cod and desc:
+            return f"{cod} - {desc}"
+        if cod or desc:
+            return cod or desc
     return ""
 
 
@@ -199,19 +201,15 @@ def montar_linhas(registros: Iterable[dict[str, Any]], estab: dict[str, Any],
         if r["categoria"] == "ESTABELECIMENTO":
             item["estab"] = r.get("descricao_planilha") or "Alteração no cadastro do estabelecimento"
             item["_k"] = "estab"
-        elif r["operacao"] in ("INCLUSAO", "EXCLUSAO"):
-            k = "inclusao" if r["operacao"] == "INCLUSAO" else "exclusao"
+        else:
+            desc = (r.get("descricao_planilha") or "").strip()
+            k = "exclusao" if r["operacao"] == "EXCLUSAO" else "inclusao"
             item[k] = r["nome_profissional"]
             for suf, v in ident.items():
                 item[f"{k}_{suf}"] = v
-            item["_k"] = k
-        else:
-            desc = (r.get("descricao_planilha") or "").strip()
-            extra = "; ".join(p for p in (
-                f"CPF {ident['cpf']}" if ident["cpf"] else "", f"CNS {ident['cns']}" if ident["cns"] else "") if p)
-            nome = f"{r['nome_profissional']} ({extra})" if extra else r["nome_profissional"]
-            item["outras"] = f"{nome} – {desc}" if desc else nome
-            item["_k"] = "outras"
+            if desc:
+                item["outras"] = desc          # texto exato de "Descrição da alteração"
+            item["_k"] = k if r["operacao"] in ("INCLUSAO", "EXCLUSAO") else "outras"
         out.append(item)
     out.sort(key=lambda i: (ordem[i["_k"]], str(i.get("inclusao") or i.get("exclusao")
                                                  or i.get("outras") or i.get("estab")).upper()))

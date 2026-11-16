@@ -1,5 +1,6 @@
 import io
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -165,8 +166,9 @@ class PlanilhaTests(unittest.TestCase):
         self.assertEqual((ws["H7"].value, ws["I7"].value), ("04854630914", "703205645229093"))
         self.assertEqual(ws["J10"].value, "Saiu")
         self.assertEqual((ws["K10"].value, ws["L10"].value, ws["M10"].value),
-                         ("Medico Clinico", "11228170967", "709806041946495"))
-        self.assertEqual(ws["N11"].value, "Mudou – Horário Ambulatorial")
+                         ("225125 - MEDICO CLINICO", "11228170967", "709806041946495"))
+        self.assertEqual(ws["N11"].value, "Horário Ambulatorial")
+        self.assertEqual((ws["F11"].value, ws["N10"].value), ("Mudou", None))
         self.assertEqual(ws["D6"].value.date(), date(2026, 10, 27))
         # dados 6..24 (19 linhas mínimas); rodapé começa na linha 25
         self.assertEqual(ws["A25"].value, "ALTERAÇÕES FEITA POR: MARIA")
@@ -183,7 +185,25 @@ class PlanilhaTests(unittest.TestCase):
                      data_envio="2026-10-27", descricao_planilha="CBO X para Y",
                      dados={"cpf": "123", "cns": "456"})]
         ln = planilha.montar_linhas(regs, ESTAB, "OUTUBRO")[0]
-        self.assertEqual(ln["outras"], "Ana (CPF 123; CNS 456) – CBO X para Y")
+        self.assertEqual(ln["outras"], "CBO X para Y")
+        self.assertEqual((ln["inclusao"], ln["inclusao_cpf"], ln["inclusao_cns"]), ("Ana", "123", "456"))
+
+    def test_categoria_codigo_e_descricao(self):
+        d = {"vinculos": [{"cbo_cod": "225125", "cbo_desc": "MEDICO CLINICO"}]}
+        self.assertEqual(planilha._categoria(d), "225125 - MEDICO CLINICO")
+        self.assertEqual(planilha._categoria({"categoria_prof": "X"}), "X")
+
+    def test_tabela_vinculos(self):
+        from app import vinculos as v
+        self.assertTrue(v.exige_cnpj("01", "01", "02"))
+        self.assertFalse(v.exige_cnpj("01", "01", "01"))
+        self.assertTrue(v.exige_cnpj("08", "05", "02"))
+        self.assertIsNone(v.achar("01", "01", "09"))
+        self.assertEqual(len(v.subtipos("05", "01")), 2)
+        self.assertTrue(v.valid_cnpj("11.222.333/0001-81"))
+        self.assertFalse(v.valid_cnpj("11222333000182"))
+        self.assertFalse(v.valid_cnpj("11111111111111"))
+        self.assertEqual(v.format_cnpj("11222333000181"), "11.222.333/0001-81")
 
     def test_rodape_desce_com_muitas_linhas(self):
         linhas = planilha.montar_linhas(self._regs(n_inc=30), ESTAB, "OUTUBRO")  # 33 linhas
@@ -353,7 +373,7 @@ class UsersTests(unittest.TestCase):
             c.execute("INSERT INTO usuarios(usuario,nome,senha_hash,criado_em) VALUES (?,?,?,?)",
                       (u, u, hash_password("senha-antiga-1", iterations=1000), "2026-01-01"))
         c.commit(); c.close()
-        db = Database(f)
+        db = Database(f, allow_migrate=True)
         perfis = {r["usuario"]: (r["perfil"], r["ativo"]) for r in db.list_users()}
         db.close()
         self.assertEqual(perfis, {"primeiro": ("ADMIN", 1), "segundo": ("COMUM", 1)})
@@ -458,6 +478,56 @@ class IbgeValidationTests(unittest.TestCase):
         self.assertEqual(self._erros(""), [])
         self.assertEqual(len(self._erros("41019")), 2)   # 5 dígitos: inválido
         self.assertEqual(len(self._erros("41019000")), 2)
+
+
+class VersaoBancoTests(unittest.TestCase):
+    def _novo(self, t):
+        from app.db import Database
+        p = os.path.join(t, "x.db")
+        d = Database(p)
+        d.close()
+        return p
+
+    def test_banco_novo_registra_versao(self):
+        from app import __version__
+        from app.db import Database, SCHEMA_VERSION
+        with tempfile.TemporaryDirectory() as t:
+            d = Database(self._novo(t))
+            vi = d.version_info()
+            self.assertEqual(vi["esquema_banco"], str(SCHEMA_VERSION))
+            self.assertEqual(vi["criado_pela_versao"], __version__)
+            d.close()
+
+    def test_banco_mais_novo_bloqueia(self):
+        from app.db import Database, DbVersionError
+        with tempfile.TemporaryDirectory() as t:
+            p = self._novo(t)
+            c = sqlite3.connect(p)
+            c.execute("UPDATE config SET valor='99' WHERE chave='schema_version'")
+            c.execute("UPDATE config SET valor='9.9.0' WHERE chave='ultimo_acesso_versao'")
+            c.commit(); c.close()
+            with self.assertRaises(DbVersionError) as cm:
+                Database(p)
+            self.assertIn("9.9.0", str(cm.exception))
+            c = sqlite3.connect(p)   # nada foi alterado
+            self.assertEqual(c.execute("SELECT valor FROM config WHERE chave='schema_version'").fetchone()[0], "99")
+            c.close()
+
+    def test_banco_antigo_pede_confirmacao_e_faz_backup(self):
+        from app.db import Database, DbMigrationNeeded, SCHEMA_VERSION
+        with tempfile.TemporaryDirectory() as t:
+            p = self._novo(t)
+            c = sqlite3.connect(p)
+            c.execute("DELETE FROM config WHERE chave IN ('schema_version','criado_pela_versao')")
+            c.execute("INSERT INTO usuarios(usuario,nome,senha_hash,criado_em) VALUES('a','A','x','2026-01-01')")
+            c.commit(); c.close()
+            with self.assertRaises(DbMigrationNeeded):
+                Database(p)
+            d = Database(p, allow_migrate=True)
+            self.assertTrue(d.backup_path and os.path.exists(d.backup_path))
+            self.assertEqual(d.version_info()["esquema_banco"], str(SCHEMA_VERSION))
+            d.close()
+            Database(p).close()   # depois de migrado, abre sem perguntar
 
 
 if __name__ == "__main__":

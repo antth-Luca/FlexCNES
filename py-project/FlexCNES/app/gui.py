@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+from typing import Any
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
@@ -17,7 +18,8 @@ from tkinter import filedialog, messagebox, ttk
 import customtkinter as ctk
 
 from . import __version__, cnes_import, dbaccess, planilha, settings
-from .db import AuthError, Database
+from . import vinculos as vinculos_tbl
+from .db import AuthError, Database, DbMigrationNeeded, DbVersionError
 from .paths import (app_db_path, cnes_db_path, db_dir, default_db_dir, default_output_dir,
                     resource_path)
 from .security import password_problems
@@ -97,12 +99,10 @@ F21_VINC = [
     ("registro", "34.4.1 Registro no conselho", "entry", 16, None),
     ("orgao", "34.4.2 Órgão emissor", "entry", 12, None),
     ("sus", "34.4.3 Atendimento ao SUS", "radio", 0, [("S", "Sim"), ("N", "Não")]),
-    ("vinc_cod", "34.4.4 Vinculação – cód.", "entry", 6, None),
-    ("vinc_desc", "Vinculação – descrição", "entry", 24, None),
-    ("tipo_cod", "Tipo – cód.", "entry", 6, None),
-    ("tipo_desc", "Tipo – descrição", "entry", 24, None),
-    ("sub_cod", "Sub-tipo – cód.", "entry", 6, None),
-    ("sub_desc", "Sub-tipo – descrição", "entry", 20, None),
+    ("vinc_sel", "34.4.4 Vinculação", "combo", 34, []),
+    ("tipo_sel", "Tipo", "combo", 40, []),
+    ("sub_sel", "Sub-tipo", "combo", 34, []),
+    ("cnpj_vinc", "CNPJ complementar (cedente/contratante)", "entry", 20, None),
     ("cbo_cod", "34.4.5 CBO – código (lupa: buscar)", "search_left", 10, None),
     ("cbo_desc", "CBO – descrição", "entry", 36, None),
     ("ch_amb", "34.4.6 CH ambulatorial", "entry", 6, None),
@@ -311,6 +311,7 @@ class FormPanel(ctk.CTkFrame):
         actions = actions or {}
         self.vars: dict[str, tk.StringVar] = {}
         self.kinds: dict[str, str] = {}
+        self.widgets: dict[str, Any] = {}
         for i, (key, text, kind, width, opts) in enumerate(fields):
             r, c = divmod(i, per_row)
             cell = ctk.CTkFrame(self, fg_color="transparent")
@@ -335,7 +336,8 @@ class FormPanel(ctk.CTkFrame):
                 icon_button(row, actions.get(key, lambda: None)).pack(side="left", padx=(0, 4))
                 entry(row, var, width).pack(side="left")
             elif kind == "combo":
-                combo(cell, var, opts, width).pack(anchor="w")
+                self.widgets[key] = combo(cell, var, opts, width)
+                self.widgets[key].pack(anchor="w")
             else:
                 entry(cell, var, width).pack(anchor="w")
                 if kind == "date":
@@ -776,6 +778,15 @@ class AdminDialog(Modal):
         button(row, "Editar…", self.edit, kind="secondary").pack(side="left", padx=6)
         button(row, "Redefinir senha…", self.reset, kind="secondary").pack(side="left")
         DbLocationPanel(t_db, app, self._db_changed).pack(anchor="w", padx=6)
+        try:
+            vi = app.db.version_info()
+            label(t_db, f"Versões – programa: {vi['programa']} (esquema {vi['esquema_programa']}) · "
+                        f"banco: esquema {vi['esquema_banco']}, criado pela {vi['criado_pela_versao']}\n"
+                        f"Último acesso: {vi['ultimo_acesso_em']} · FlexCNES {vi['ultimo_acesso_versao']} · "
+                        f"{vi['ultimo_acesso_maquina']}", justify="left", anchor="w",
+                  wraplength=640).pack(anchor="w", padx=8, pady=(10, 0))
+        except Exception:
+            pass
         self.refresh()
 
     def _db_changed(self):
@@ -898,13 +909,11 @@ class VinculosPanel(ctk.CTkFrame):
         self.vinculos: list[dict] = []
         label(self, "Cada ficha 21 comporta 3 vínculos; acima disso, páginas adicionais são geradas "
                     "automaticamente.", wraplength=820, justify="left", anchor="w").pack(anchor="w", pady=(0, 4))
-        # Os botões são empacotados ANTES (side="bottom"): assim nunca somem quando a janela é baixa;
-        # o que encolhe é a área de campos, que tem rolagem.
         row = ctk.CTkFrame(self, fg_color="transparent")
         row.pack(side="bottom", anchor="w", pady=6)
         box = TreeBox(self, ("cbo", "desc", "entrada", "deslig"),
                       (("cbo", "CBO", 80), ("desc", "Descrição", 280), ("entrada", "Entrada", 90),
-                       ("deslig", "Desligamento", 100)), height=4)
+                       ("deslig", "Desligamento", 100)), height=3)
         box.pack(fill="x", pady=4)
         self.tree = box.tree
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
@@ -912,10 +921,79 @@ class VinculosPanel(ctk.CTkFrame):
         self.scroll.pack(fill="both", expand=True)
         self.form = FormPanel(self.scroll, F21_VINC, per_row=4, actions={"cbo_cod": self.buscar_cbo})
         self.form.pack(anchor="w")
+        self._lock = False
+        vs = self.form.vars
+        self._set_combo("vinc_sel", [f"{c} - {d}" for c, d in vinculos_tbl.vinculacoes()])
+        vs["vinc_sel"].trace_add("write", lambda *_: self._cascade("vinc"))
+        vs["tipo_sel"].trace_add("write", lambda *_: self._cascade("tipo"))
         button(row, "Adicionar vínculo", self.add).pack(side="left")
         button(row, "Atualizar selecionado", self.update_sel, kind="secondary").pack(side="left", padx=6)
         button(row, "Remover selecionado", self.remove, kind="danger").pack(side="left")
-        button(row, "Limpar campos", self.form.clear, kind="secondary").pack(side="left", padx=6)
+        button(row, "Limpar campos", self.limpar, kind="secondary").pack(side="left", padx=6)
+
+    # --- Vinculação / Tipo / Sub-tipo (Portaria GM/MS 1.130/2017) ---
+    def _set_combo(self, key: str, values: list[str]):
+        try:
+            self.form.widgets[key].configure(values=values)
+        except Exception:
+            pass
+
+    def _cod(self, key: str) -> str:
+        return self.form.vars[key].get().split(" - ", 1)[0].strip()
+
+    def _cascade(self, nivel: str):
+        if self._lock:
+            return
+        vs = self.form.vars
+        self._lock = True
+        try:
+            if nivel == "vinc":
+                tipos = [f"{c} - {d}" for c, d in vinculos_tbl.tipos(self._cod("vinc_sel"))]
+                self._set_combo("tipo_sel", tipos)
+                vs["tipo_sel"].set(tipos[0] if len(tipos) == 1 else "")
+                self._set_combo("sub_sel", [])
+                vs["sub_sel"].set("")
+            if nivel in ("vinc", "tipo"):
+                subs = [f"{c} - {d}" for c, d in vinculos_tbl.subtipos(self._cod("vinc_sel"), self._cod("tipo_sel"))]
+                self._set_combo("sub_sel", subs)
+                vs["sub_sel"].set(subs[0] if len(subs) == 1 else "")
+        finally:
+            self._lock = False
+
+    def _expand(self, v: dict) -> dict:
+        """Combos -> seis chaves de layout (cód./descrição) usadas pela ficha."""
+        v = dict(v)
+        out = {k: x for k, x in v.items() if k not in ("vinc_sel", "tipo_sel", "sub_sel")}
+        row = vinculos_tbl.achar(self._cod("vinc_sel"), self._cod("tipo_sel"), self._cod("sub_sel"))
+        if row:
+            out.update(vinc_cod=row[0], vinc_desc=row[1], tipo_cod=row[2], tipo_desc=row[3],
+                       sub_cod=row[4], sub_desc=row[5])
+        return out
+
+    def _load(self, v: dict):
+        """Seis chaves -> combos."""
+        data = dict(v)
+        self._lock = True
+        try:
+            vc, tc, sc = v.get("vinc_cod", ""), v.get("tipo_cod", ""), v.get("sub_cod", "")
+            self._set_combo("tipo_sel", [f"{c} - {d}" for c, d in vinculos_tbl.tipos(vc)])
+            self._set_combo("sub_sel", [f"{c} - {d}" for c, d in vinculos_tbl.subtipos(vc, tc)])
+            row = vinculos_tbl.achar(vc, tc, sc)
+            if row:
+                data["vinc_sel"], data["tipo_sel"], data["sub_sel"] = (
+                    f"{row[0]} - {row[1]}", f"{row[2]} - {row[3]}", f"{row[4]} - {row[5]}")
+            self.form.set(data)
+        finally:
+            self._lock = False
+
+    def limpar(self):
+        self._lock = True
+        try:
+            self.form.clear()
+            self._set_combo("tipo_sel", [])
+            self._set_combo("sub_sel", [])
+        finally:
+            self._lock = False
 
     def refresh(self):
         self.tree.delete(*self.tree.get_children())
@@ -925,19 +1003,28 @@ class VinculosPanel(ctk.CTkFrame):
 
     def set_all(self, vinculos: list[dict]):
         self.vinculos = [dict(v) for v in vinculos]
-        self.form.clear()
+        self.limpar()
         self.refresh()
 
     def on_select(self, _=None):
         sel = self.tree.selection()
         if sel:
-            self.form.set(self.vinculos[int(sel[0])])
+            self._load(self.vinculos[int(sel[0])])
 
     def _check(self) -> dict | None:
-        v = self.form.get()
+        v = self._expand(self.form.get())
         if not any(v.values()):
             messagebox.showinfo("Vínculo", "Preencha ao menos um campo do vínculo.", parent=self)
             return None
+        cod = [self._cod(k) for k in ("vinc_sel", "tipo_sel", "sub_sel")]
+        if any(cod) and not vinculos_tbl.achar(*cod):
+            messagebox.showinfo("Vínculo", "Escolha Vinculação, Tipo e Sub-tipo completos.", parent=self)
+            return None
+        if vinculos_tbl.exige_cnpj(*cod) and not vinculos_tbl.valid_cnpj(v.get("cnpj_vinc")):
+            messagebox.showinfo("Vínculo", "Esta combinação exige CNPJ válido (14 dígitos).", parent=self)
+            return None
+        if v.get("cnpj_vinc"):
+            v["cnpj_vinc"] = vinculos_tbl.format_cnpj(v["cnpj_vinc"])
         return v
 
     def add(self):
@@ -945,7 +1032,7 @@ class VinculosPanel(ctk.CTkFrame):
         if v:
             self.vinculos.append(v)
             self.refresh()
-            self.form.clear()
+            self.limpar()
 
     def update_sel(self):
         sel = self.tree.selection()
@@ -962,7 +1049,7 @@ class VinculosPanel(ctk.CTkFrame):
         if sel:
             del self.vinculos[int(sel[0])]
             self.refresh()
-            self.form.clear()
+            self.limpar()
 
     def buscar_cbo(self):
         base = self.main.app.cnes_base
@@ -1276,11 +1363,18 @@ class PlanilhaTab(ctk.CTkFrame):
         ano, mes = self._comp()
         linhas = self.main.app.service.linhas_planilha(self.main.app.session, est_id, ano, mes)
         for ln in linhas:
+            d = ln.get("data_envio")
+            dt = format_date(d) if d else ""
+            if ln.get("outras") and (ln.get("inclusao") or ln.get("exclusao")):
+                pessoa = ln.get("inclusao") or ln.get("exclusao")
+                if ln.get("inclusao") and ln.get("exclusao"):
+                    pessoa = ln["inclusao"]
+                self.tree.insert("", "end", values=("Outras alterações", f"{pessoa} – {ln['outras']}", dt))
+                continue
             for key, nome in (("estab", "Estabelecimento"), ("inclusao", "Profissionais – Inclusão"),
                               ("exclusao", "Profissionais – Exclusão"), ("outras", "Outras alterações")):
                 if ln.get(key):
-                    d = ln.get("data_envio")
-                    self.tree.insert("", "end", values=(nome, ln[key], format_date(d) if d else ""))
+                    self.tree.insert("", "end", values=(nome, ln[key], dt))
         self.lbl.configure(text=f"{len(linhas)} linha(s) para {MESES[mes - 1].capitalize()}/{ano}, "
                                 f"feitas por {self.main.app.session.nome}.")
 
@@ -1602,6 +1696,21 @@ class App(ctk.CTk):
                 try:
                     self.db = Database(path)
                     return True
+                except DbVersionError as e:
+                    msg = str(e)
+                except DbMigrationNeeded as e:
+                    if messagebox.askyesno(
+                            "Atualizar banco de dados",
+                            f"{e}\n\nSerá criada uma cópia de segurança ao lado do arquivo. Depois da "
+                            "atualização, os outros computadores precisarão do FlexCNES "
+                            f"{e.app_version} ou mais novo.\n\nAtualizar agora?", parent=self):
+                        try:
+                            self.db = Database(path, allow_migrate=True)
+                            return True
+                        except sqlite3.Error as e2:
+                            msg = f"Falha ao atualizar o banco:\n{e2}"
+                    else:
+                        msg = "Atualização do banco não confirmada."
                 except sqlite3.Error as e:
                     msg = f"Não foi possível abrir o banco:\n{e}"
             choice = DbFailDialog(self, path, msg).run() or "exit"
