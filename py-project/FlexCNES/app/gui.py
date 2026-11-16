@@ -279,8 +279,14 @@ def theme_menu(master, app: "App"):
 class TreeBox(ctk.CTkFrame):
     """ttk.Treeview (tabela) com barra de rolagem do CTk, estilizada pelo tema."""
 
-    def __init__(self, master, columns, heads, height: int = 8):
-        super().__init__(master, fg_color="transparent")
+    def __init__(self, master, columns, heads, height: int = 8, fixed: bool = False):
+        # fixed=True: a caixa tem exatamente `height` linhas (em pixels), sem crescer nem encolher
+        if fixed:
+            px_height = (height if height > 0 else 1) * 26 + 4
+            super().__init__(master, fg_color="transparent", height=px_height)
+            self.pack_propagate(False)
+        else:
+            super().__init__(master, fg_color="transparent")
         self.tree = ttk.Treeview(self, columns=columns, show="headings", height=height,
                                  selectmode="browse")
         for c, t, w in heads:
@@ -913,7 +919,7 @@ class VinculosPanel(ctk.CTkFrame):
         row.pack(side="bottom", anchor="w", pady=6)
         box = TreeBox(self, ("cbo", "desc", "entrada", "deslig"),
                       (("cbo", "CBO", 80), ("desc", "Descrição", 280), ("entrada", "Entrada", 90),
-                       ("deslig", "Desligamento", 100)), height=3)
+                       ("deslig", "Desligamento", 100)), height=3, fixed=True)
         box.pack(fill="x", pady=4)
         self.tree = box.tree
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
