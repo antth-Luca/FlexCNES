@@ -170,10 +170,7 @@ def _dados(r: dict[str, Any]) -> dict[str, Any]:
 
 
 def _categoria(dados: dict[str, Any]) -> str:
-    """Categoria profissional da planilha: campo informado; senão "código - descrição" do 1º CBO."""
-    cat = str(dados.get("categoria_prof") or "").strip()
-    if cat:
-        return cat
+    """Categoria profissional da planilha: "código - descrição" do CBO do 1º vínculo."""
     for v in dados.get("vinculos") or []:
         cod = (v.get("cbo_cod") or "").strip()
         desc = (v.get("cbo_desc") or "").strip()

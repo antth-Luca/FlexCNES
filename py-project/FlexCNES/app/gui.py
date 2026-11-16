@@ -1076,7 +1076,7 @@ class RegistroTab(ctk.CTkFrame):
         self.ano = tk.StringVar(value=str(today.year))
         self.envio = tk.StringVar(value=format_date(today))
         self.usa20, self.usa21 = tk.BooleanVar(value=True), tk.BooleanVar(value=False)
-        self.descr, self.nome, self.categ = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        self.descr, self.nome = tk.StringVar(), tk.StringVar()
         _auto_date(self.envio)
 
         top = ctk.CTkFrame(self)
@@ -1098,12 +1098,6 @@ class RegistroTab(ctk.CTkFrame):
         entry(r1, self.nome, 44).pack(side="left", padx=6)
         check(r1, "Preencher Ficha 20", self.usa20).pack(side="left", padx=(16, 0))
         check(r1, "Preencher Ficha 21", self.usa21).pack(side="left", padx=(10, 0))
-        r1b = ctk.CTkFrame(top, fg_color="transparent")
-        r1b.pack(fill="x", padx=12, pady=2)
-        label(r1b, "Categoria profissional (planilha):").pack(side="left")
-        entry(r1b, self.categ, 30).pack(side="left", padx=6)
-        label(r1b, "Vazio = usa o CBO do 1º vínculo. CPF e CNS vêm da aba Identificação.",
-              font=font(11)).pack(side="left", padx=6)
         r2 = ctk.CTkFrame(top, fg_color="transparent")
         r2.pack(fill="x", padx=12, pady=(2, 10))
         label(r2, "Descrição da alteração (vai para a planilha; ex.: Horário Ambulatorial):").pack(side="left")
@@ -1155,8 +1149,7 @@ class RegistroTab(ctk.CTkFrame):
             panel.vars[uf_key].set(m["uf"])
 
     def collect(self) -> dict:
-        dados = {**self.f20a.get(), **self.f20b.get(), "nome": self.nome.get().strip(),
-                 "categoria_prof": self.categ.get().strip()}
+        dados = {**self.f20a.get(), **self.f20b.get(), "nome": self.nome.get().strip()}
         try:
             ano = int(self.ano.get())
         except ValueError:
@@ -1179,7 +1172,6 @@ class RegistroTab(ctk.CTkFrame):
         self.usa21.set(form["usa_ficha21"])
         self.descr.set(form["descricao_planilha"])
         self.nome.set(form["dados"].get("nome", ""))
-        self.categ.set(form["dados"].get("categoria_prof", ""))
         self.f20a.set(form["dados"])
         self.f20b.set(form["dados"])
         self.vinc.set_all(form["vinculos"])
@@ -1188,7 +1180,6 @@ class RegistroTab(ctk.CTkFrame):
     def reset(self):
         self.editing_id = None
         self.nome.set("")
-        self.categ.set("")
         self.descr.set("")
         self.f20a.clear()
         self.f20b.clear()

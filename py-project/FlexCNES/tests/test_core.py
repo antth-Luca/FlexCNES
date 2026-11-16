@@ -137,7 +137,7 @@ class PdfTests(unittest.TestCase):
 
 class PlanilhaTests(unittest.TestCase):
     def _regs(self, n_inc=3):
-        d = {"cpf": "04854630914", "cns": "703205645229093", "categoria_prof": "Auxiliar de Enfermagem"}
+        d = {"cpf": "04854630914", "cns": "703205645229093", "vinculos": [{"cbo_cod": "322205", "cbo_desc": "TECNICO DE ENFERMAGEM"}]}
         regs = [dict(categoria="PROFISSIONAL", operacao="INCLUSAO", nome_profissional=f"Pessoa {i}",
                      data_envio="2026-10-27", descricao_planilha="", dados=d) for i in range(n_inc)]
         regs.append(dict(categoria="PROFISSIONAL", operacao="EXCLUSAO", nome_profissional="Saiu",
@@ -162,7 +162,7 @@ class PlanilhaTests(unittest.TestCase):
         self.assertEqual(ws["A2"].value, "MUNICÍPIO: ASTORGA - PR          15ª Regional de Saúde")
         self.assertEqual(ws["A6"].value, 2733579)
         self.assertEqual(ws["E6"].value, "Novo telefone")
-        self.assertEqual((ws["F7"].value, ws["G7"].value), ("Pessoa 0", "Auxiliar de Enfermagem"))
+        self.assertEqual((ws["F7"].value, ws["G7"].value), ("Pessoa 0", "322205 - TECNICO DE ENFERMAGEM"))
         self.assertEqual((ws["H7"].value, ws["I7"].value), ("04854630914", "703205645229093"))
         self.assertEqual(ws["J10"].value, "Saiu")
         self.assertEqual((ws["K10"].value, ws["L10"].value, ws["M10"].value),
@@ -191,7 +191,7 @@ class PlanilhaTests(unittest.TestCase):
     def test_categoria_codigo_e_descricao(self):
         d = {"vinculos": [{"cbo_cod": "225125", "cbo_desc": "MEDICO CLINICO"}]}
         self.assertEqual(planilha._categoria(d), "225125 - MEDICO CLINICO")
-        self.assertEqual(planilha._categoria({"categoria_prof": "X"}), "X")
+        self.assertEqual(planilha._categoria({}), "")
 
     def test_tabela_vinculos(self):
         from app import vinculos as v
