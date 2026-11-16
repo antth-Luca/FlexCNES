@@ -1,4 +1,4 @@
-<p align="center"><img alt="FlexCNES logo" src="https://github.com/antth-Luca/FlexCNES/blob/v0.2.0/repo-icon.png" width="160"></p>
+<p align="center"><img alt="FlexCNES logo" src="https://github.com/antth-Luca/FlexCNES/blob/v0.2.1/repo-icon.png" width="160"></p>
 
 # FlexCNES — Assistente de preenchimento de fichas e planilha CNES
 
